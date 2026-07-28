@@ -1,12 +1,14 @@
 mod commands;
 mod cron;
 mod memory;
+mod server;
 mod ssh;
 
 use commands::AppState;
 use cron::CronService;
 use memory::MemoryStore;
 use ssh::manager::SshConfig;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
@@ -25,12 +27,30 @@ pub fn run() {
     let ssh_manager = Arc::new(ssh::manager::SshManager::new(ssh_config));
     let cron_service = Arc::new(CronService::new());
     let memory_store = Arc::new(Mutex::new(MemoryStore::load()));
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    // Start the local WebSocket server (chat + command endpoint)
+    // Hermes reaches this via the reverse SSH tunnel.
+    let server_shutdown = Arc::clone(&shutdown);
+    let server_port: u16 = 9000;
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new()
+            .expect("Failed to create server Tokio runtime");
+        rt.block_on(async {
+            if let Err(e) = server::run_server(server_port, server_shutdown).await {
+                log::error!("WebSocket server error: {}", e);
+            }
+        });
+    });
+    log::info!("Local WebSocket server starting on port {}", server_port);
 
     let app_state = AppState {
         ssh: ssh_manager,
         cron: cron_service.clone(),
         memory: memory_store,
     };
+
+    let app_shutdown = Arc::clone(&shutdown);
 
     tauri::Builder::default()
         .manage(app_state)
@@ -65,6 +85,11 @@ pub fn run() {
                 .build(app)?;
 
             Ok(())
+        })
+        .on_window_event(move |_window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                app_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::ssh_connect,

@@ -63,8 +63,9 @@ pub fn start_reverse_tunnel(
                             Duration::from_secs(5),
                         ) {
                             Ok(local_stream) => {
-                                // Make both ends non-blocking for bidirectional copy
-                                let _ = remote_channel.setblocking(false);
+                                // Set session to non-blocking for the tunnel
+                                session.set_blocking(false);
+
                                 let _ = local_stream.set_nonblocking(true);
 
                                 // Set read timeouts

@@ -48,6 +48,7 @@ pub fn run() {
         ssh: ssh_manager,
         cron: cron_service.clone(),
         memory: memory_store,
+        shutdown: Arc::clone(&shutdown),
     };
 
     let app_shutdown = Arc::clone(&shutdown);

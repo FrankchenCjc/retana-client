@@ -3,6 +3,8 @@
 use crate::cron::CronService;
 use crate::memory::MemoryStore;
 use crate::ssh::manager::{ConnectionStatus, SshConfig, SshManager};
+use crate::ssh::reverse_tunnel;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tauri::State;
 
@@ -11,16 +13,34 @@ pub struct AppState {
     pub ssh: Arc<SshManager>,
     pub cron: Arc<CronService>,
     pub memory: Arc<std::sync::Mutex<MemoryStore>>,
+    pub shutdown: Arc<AtomicBool>,
 }
 
 // ─── SSH Commands ───
 
 #[tauri::command]
-pub async fn ssh_connect(state: State<'_, AppState>, _config: SshConfig) -> Result<String, String> {
-    // Update the manager config by reconnecting
-    match state.ssh.connect() {
-        Ok(()) => Ok("Connected successfully".to_string()),
-        Err(e) => Err(format!("Connection failed: {}", e)),
+pub async fn ssh_connect(state: State<'_, AppState>, config: SshConfig) -> Result<String, String> {
+    // Connect to the Hermes server
+    state.ssh.connect_with_config(&config).map_err(|e| format!("Connection failed: {}", e))?;
+
+    // If reverse tunnel is configured, start it
+    if let Some(ref rt) = config.reverse_tunnel {
+        let session = state.ssh.session_arc()
+            .ok_or("No active session".to_string())?;
+        let shutdown = Arc::clone(&state.shutdown);
+        reverse_tunnel::start_reverse_tunnel(
+            session,
+            rt.remote_port,
+            rt.local_port,
+            shutdown,
+        ).map_err(|e| format!("Reverse tunnel failed: {}", e))?;
+
+        Ok(format!(
+            "Connected. Reverse tunnel: remote:{} → local:{}",
+            rt.remote_port, rt.local_port
+        ))
+    } else {
+        Ok("Connected successfully (no reverse tunnel configured)".to_string())
     }
 }
 

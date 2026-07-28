@@ -16,12 +16,10 @@ use std::time::Duration;
 /// Start a persistent reverse SSH tunnel.
 ///
 /// `remote_port` — port on the Hermes server that Hermes will connect to
-/// `local_port`  — port on retana (this machine) where our local server listens
+/// `local_port`  — port on retana where our WebSocket server listens
 ///
-/// Spawns a background thread that:
-/// 1. Opens a reverse-forward listener on the remote (Hermes) side
-/// 2. Accepts incoming connections
-/// 3. Bidirectionally copies data between the remote channel and local port
+/// Spawns a background thread that accepts reverse-forwarded connections
+/// and bidirectionally copies data between the remote channel and local port.
 pub fn start_reverse_tunnel(
     session: Arc<Session>,
     remote_port: u16,
@@ -35,22 +33,19 @@ pub fn start_reverse_tunnel(
     );
 
     // Start listening for reverse-forward connections on the remote side.
-    // ssh2 0.9 API: channel_forward_listen(port, host, bound_port)
+    // ssh2 0.9: channel_forward_listen returns (Listener, u16)
     let mut listener = session
         .channel_forward_listen(remote_port, None, None)
-        .context("Failed to start reverse forward listener")?;
-
-    let local_port = local_port;
+        .context("Failed to start reverse forward listener")?
+        .0; // Extract Listener from tuple
 
     thread::Builder::new()
         .name("reverse-tunnel".into())
         .spawn(move || {
-            log::info!("Reverse tunnel listener started on remote port {}", remote_port);
-
-            // Set a read timeout so we can check the shutdown flag periodically
-            if let Err(e) = session.set_timeout(1000) {
-                log::warn!("Failed to set session timeout: {}", e);
-            }
+            log::info!(
+                "Reverse tunnel listener started on remote port {}",
+                remote_port
+            );
 
             loop {
                 if shutdown.load(Ordering::Relaxed) {
@@ -62,86 +57,83 @@ pub fn start_reverse_tunnel(
                     Ok(mut remote_channel) => {
                         log::info!("Reverse tunnel: accepted connection from remote");
 
-                        // Connect to local service
                         let local_addr = format!("127.0.0.1:{}", local_port);
                         match TcpStream::connect_timeout(
-                            &local_addr
-                                .parse()
-                                .unwrap(),
+                            &local_addr.parse().unwrap(),
                             Duration::from_secs(5),
                         ) {
-                            Ok(mut local_stream) => {
-                                // Bidirectional copy between remote channel and local stream
-                                // We need two threads for full duplex, or use non-blocking I/O.
-                                // For simplicity, use two threads.
+                            Ok(local_stream) => {
+                                // Make both ends non-blocking for bidirectional copy
+                                let _ = remote_channel.setblocking(false);
+                                let _ = local_stream.set_nonblocking(true);
 
-                                let mut remote_read = remote_channel.try_clone()
-                                    .expect("Failed to clone remote channel for reading");
+                                // Set read timeouts
+                                let _ = local_stream.set_read_timeout(Some(
+                                    Duration::from_millis(500),
+                                ));
 
-                                let read_shutdown = Arc::clone(&shutdown);
+                                let mut buf = [0u8; 16384];
+                                let mut local_buf = [0u8; 16384];
 
-                                // Remote → Local
-                                let t1 = thread::spawn(move || {
-                                    let mut buf = [0u8; 8192];
-                                    loop {
-                                        if read_shutdown.load(Ordering::Relaxed) {
-                                            break;
-                                        }
-                                        match remote_read.read(&mut buf) {
-                                            Ok(0) => break, // EOF
-                                            Ok(n) => {
-                                                if local_stream.write_all(&buf[..n]).is_err() {
-                                                    break;
-                                                }
-                                                let _ = local_stream.flush();
-                                            }
-                                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                                thread::sleep(Duration::from_millis(50));
-                                                continue;
-                                            }
-                                            Err(_) => break,
-                                        }
+                                loop {
+                                    if shutdown.load(Ordering::Relaxed) {
+                                        break;
                                     }
-                                    log::debug!("Reverse tunnel: remote→local done");
-                                });
 
-                                // Local → Remote
-                                let mut local_read = local_stream
-                                    .try_clone()
-                                    .expect("Failed to clone local stream");
-                                let mut remote_write = remote_channel;
+                                    let mut did_work = false;
 
-                                let write_shutdown = Arc::clone(&shutdown);
-
-                                let t2 = thread::spawn(move || {
-                                    let mut buf = [0u8; 8192];
-                                    // Set read timeout on local stream
-                                    let _ = local_read.set_read_timeout(Some(Duration::from_millis(500)));
-                                    loop {
-                                        if write_shutdown.load(Ordering::Relaxed) {
-                                            break;
-                                        }
-                                        match local_read.read(&mut buf) {
-                                            Ok(0) => break,
-                                            Ok(n) => {
-                                                if remote_write.write_all(&buf[..n]).is_err() {
-                                                    break;
-                                                }
-                                            }
-                                            Err(ref e)
-                                                if e.kind() == std::io::ErrorKind::WouldBlock
-                                                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                                    // Remote → Local
+                                    match remote_channel.read(&mut buf) {
+                                        Ok(0) => break, // EOF
+                                        Ok(n) => {
+                                            if local_stream
+                                                .write_all(&buf[..n])
+                                                .is_err()
                                             {
-                                                continue;
+                                                break;
                                             }
-                                            Err(_) => break,
+                                            let _ = local_stream.flush();
+                                            did_work = true;
                                         }
+                                        Err(ref e)
+                                            if e.kind()
+                                                == std::io::ErrorKind::WouldBlock =>
+                                        {
+                                            // No data yet
+                                        }
+                                        Err(_) => break,
                                     }
-                                    log::debug!("Reverse tunnel: local→remote done");
-                                });
 
-                                let _ = t1.join();
-                                let _ = t2.join();
+                                    // Local → Remote
+                                    match local_stream.read(&mut local_buf) {
+                                        Ok(0) => break,
+                                        Ok(n) => {
+                                            if remote_channel
+                                                .write_all(&local_buf[..n])
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                            did_work = true;
+                                        }
+                                        Err(ref e)
+                                            if e.kind()
+                                                == std::io::ErrorKind::WouldBlock
+                                                || e.kind()
+                                                    == std::io::ErrorKind::TimedOut =>
+                                        {
+                                            // No data yet
+                                        }
+                                        Err(_) => break,
+                                    }
+
+                                    if !did_work {
+                                        // Avoid busy-waiting
+                                        thread::sleep(Duration::from_millis(10));
+                                    }
+                                }
+
+                                log::debug!("Reverse tunnel: connection closed");
                             }
                             Err(e) => {
                                 log::error!(
@@ -157,7 +149,6 @@ pub fn start_reverse_tunnel(
                             break;
                         }
                         log::error!("Reverse tunnel accept error: {}", e);
-                        // Brief pause before retry
                         thread::sleep(Duration::from_secs(1));
                     }
                 }

@@ -26,9 +26,6 @@ pub fn run() {
     let cron_service = Arc::new(CronService::new());
     let memory_store = Arc::new(Mutex::new(MemoryStore::load()));
 
-    // Start cron scheduler
-    cron_service.start();
-
     let app_state = AppState {
         ssh: ssh_manager,
         cron: cron_service,
@@ -38,6 +35,8 @@ pub fn run() {
     tauri::Builder::default()
         .manage(app_state)
         .setup(|app| {
+            // Start cron scheduler (Tokio runtime is ready here)
+            cron_service.start();
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()

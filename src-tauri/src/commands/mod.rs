@@ -161,3 +161,23 @@ fn hostname() -> String {
         .trim()
         .to_string()
 }
+
+// ─── Local Execution (Hermes → retana) ───
+
+/// Execute a shell command on the local machine (retana endpoint).
+/// Called by the bridge when Hermes needs to run something on this machine.
+#[tauri::command]
+pub async fn exec_local(command: String) -> Result<serde_json::Value, String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .output()
+        .map_err(|e| format!("Failed to execute: {}", e))?;
+
+    Ok(serde_json::json!({
+        "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
+        "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
+        "exit_code": output.status.code().unwrap_or(-1),
+        "success": output.status.success(),
+    }))
+}

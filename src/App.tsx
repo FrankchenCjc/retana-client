@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import Sidebar from './components/Sidebar';
 import MessageBubble from './components/MessageBubble';
 import MessageInput from './components/MessageInput';
@@ -139,10 +140,62 @@ export default function App() {
           },
         ];
       });
+    } else if (msgType === 'tool_call') {
+      // Hermes wants retana to execute a command locally
+      const taskId = (data.task_id as string) || generateId();
+      const command = data.command as string;
+      const label = (data.label as string) || command;
+
+      handleServerMessage({
+        type: 'tool_progress',
+        label,
+        tool_type: 'tool_call',
+        status: 'running',
+      });
+
+      invoke<{ stdout: string; stderr: string; exit_code: number; success: boolean }>(
+        'exec_local',
+        { command }
+      )
+        .then((result) => {
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({
+              type: 'tool_result',
+              task_id: taskId,
+              output: result.stdout || result.stderr,
+              exit_code: result.exit_code,
+              success: result.success,
+            }));
+          }
+          handleServerMessage({
+            type: 'tool_progress',
+            label,
+            tool_type: 'tool_call',
+            status: result.success ? 'done' : 'error',
+            detail: (result.stdout + result.stderr).slice(0, 200),
+          });
+        })
+        .catch((err) => {
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({
+              type: 'tool_result',
+              task_id: taskId,
+              output: String(err),
+              exit_code: -1,
+              success: false,
+            }));
+          }
+          handleServerMessage({
+            type: 'tool_progress',
+            label,
+            tool_type: 'tool_call',
+            status: 'error',
+            detail: String(err),
+          });
+        });
     } else {
-      // Regular chat message — ignore echoes of our own user messages
       if (data.sender === 'user') {
-        return; // Don't re-add messages we already rendered locally
+        return;
       }
       const msg: Message = {
         id: generateId(),

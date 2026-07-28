@@ -1,36 +1,123 @@
 mod commands;
+mod config;
 mod cron;
 mod memory;
 mod server;
 mod ssh;
 
 use commands::AppState;
+use config::RetanaConfig;
 use cron::CronService;
 use memory::MemoryStore;
-use ssh::manager::SshConfig;
+use ssh::manager::{ReverseTunnelConfig, SshConfig};
+use ssh::reverse_tunnel;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
+/// Try to auto-connect SSH + reverse tunnel on startup.
+/// Runs in background; retries if Hermes server isn't reachable yet.
+fn auto_connect(ssh_manager: Arc<ssh::manager::SshManager>, shutdown: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        // Brief delay so WS server is up before tunnel tries to forward
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let config = match RetanaConfig::load() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("Failed to load retana config: {}", e);
+                return;
+            }
+        };
+
+        if !config.auto_connect {
+            log::info!("Auto-connect disabled in config");
+            return;
+        }
+
+        log::info!(
+            "Auto-connecting to {}@{}:{} ...",
+            config.hermes_user,
+            config.hermes_host,
+            config.hermes_port
+        );
+
+        let ssh_config = SshConfig {
+            host: config.hermes_host.clone(),
+            port: config.hermes_port,
+            username: config.hermes_user.clone(),
+            key_path: config.hermes_key.clone(),
+            password: None,
+            reverse_tunnel: Some(ReverseTunnelConfig {
+                remote_port: config.tunnel_remote_port,
+                local_port: config.tunnel_local_port,
+            }),
+        };
+
+        // Retry loop
+        let max_retries = 10;
+        for attempt in 1..=max_retries {
+            if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+
+            match ssh_manager.connect_with_config(&ssh_config) {
+                Ok(()) => {
+                    log::info!("✅ SSH connected on attempt {}", attempt);
+
+                    // Start reverse tunnel
+                    if let Some(session) = ssh_manager.session_arc() {
+                        match reverse_tunnel::start_reverse_tunnel(
+                            session,
+                            config.tunnel_remote_port,
+                            config.tunnel_local_port,
+                            Arc::clone(&shutdown),
+                        ) {
+                            Ok(()) => {
+                                log::info!("✅ Reverse tunnel established");
+                            }
+                            Err(e) => {
+                                log::error!("Reverse tunnel failed: {}", e);
+                            }
+                        }
+                    }
+                    return; // Success
+                }
+                Err(e) => {
+                    log::warn!(
+                        "SSH connect attempt {}/{} failed: {}",
+                        attempt,
+                        max_retries,
+                        e
+                    );
+                    if attempt < max_retries {
+                        let delay = std::time::Duration::from_secs(5 * attempt);
+                        log::info!("Retrying in {}s...", delay.as_secs());
+                        std::thread::sleep(delay);
+                    }
+                }
+            }
+        }
+
+        log::error!("Failed to auto-connect after {} attempts", max_retries);
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Initialize app services
-    let ssh_config = SshConfig {
-        host: "localhost".to_string(),
+    let ssh_manager = Arc::new(ssh::manager::SshManager::new(SshConfig {
+        host: "localhost".into(),
         port: 22,
-        username: "user".to_string(),
+        username: "user".into(),
         key_path: None,
         password: None,
         reverse_tunnel: None,
-    };
-
-    let ssh_manager = Arc::new(ssh::manager::SshManager::new(ssh_config));
+    }));
     let cron_service = Arc::new(CronService::new());
     let memory_store = Arc::new(Mutex::new(MemoryStore::load()));
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Start the local WebSocket server (chat + command endpoint)
-    // Hermes reaches this via the reverse SSH tunnel.
+    // Start the local WebSocket server
     let server_shutdown = Arc::clone(&shutdown);
     let server_port: u16 = 9000;
     std::thread::spawn(move || {
@@ -44,6 +131,9 @@ pub fn run() {
     });
     log::info!("Local WebSocket server starting on port {}", server_port);
 
+    // Auto-connect SSH + reverse tunnel
+    auto_connect(Arc::clone(&ssh_manager), Arc::clone(&shutdown));
+
     let app_state = AppState {
         ssh: ssh_manager,
         cron: cron_service.clone(),
@@ -56,7 +146,6 @@ pub fn run() {
     tauri::Builder::default()
         .manage(app_state)
         .setup(move |app| {
-            // Start cron scheduler (Tokio runtime is ready here)
             cron_service.start();
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -66,7 +155,6 @@ pub fn run() {
                 )?;
             }
 
-            // Set up system tray
             use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
             let _tray = TrayIconBuilder::new()
                 .on_tray_icon_event(|tray, event| {
@@ -107,6 +195,7 @@ pub fn run() {
             commands::memory_list,
             commands::memory_list_category,
             commands::system_info,
+            commands::exec_local,
         ])
         .run(tauri::generate_context!())
         .expect("error while running retana");

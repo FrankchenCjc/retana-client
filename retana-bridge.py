@@ -38,7 +38,8 @@ import aiohttp  # pip install aiohttp
 
 WS_URL = sys.argv[1] if len(sys.argv) > 1 else "ws://localhost:9000"
 HERMES_API_URL = os.environ.get("HERMES_API_URL", "http://localhost:8642/v1")
-HERMES_API_KEY = os.environ.get("HERMES_API_KEY", "change-me-local-dev")
+HERMES_API_KEY="retana-bridge-dev-key-2026"
+
 
 # ─── 消息处理 ───
 

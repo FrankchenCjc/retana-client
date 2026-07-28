@@ -140,7 +140,10 @@ export default function App() {
         ];
       });
     } else {
-      // Regular chat message from Hermes (or system)
+      // Regular chat message — ignore echoes of our own user messages
+      if (data.sender === 'user') {
+        return; // Don't re-add messages we already rendered locally
+      }
       const msg: Message = {
         id: generateId(),
         content: (data.content as string) || '',

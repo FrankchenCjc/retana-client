@@ -28,13 +28,13 @@ pub fn run() {
 
     let app_state = AppState {
         ssh: ssh_manager,
-        cron: cron_service,
+        cron: cron_service.clone(),
         memory: memory_store,
     };
 
     tauri::Builder::default()
         .manage(app_state)
-        .setup(|app| {
+        .setup(move |app| {
             // Start cron scheduler (Tokio runtime is ready here)
             cron_service.start();
             if cfg!(debug_assertions) {

@@ -62,7 +62,7 @@ pub fn start_reverse_tunnel(
                             &local_addr.parse().unwrap(),
                             Duration::from_secs(5),
                         ) {
-                            Ok(local_stream) => {
+                            Ok(mut local_stream) => {
                                 // Set session to non-blocking for the tunnel
                                 session.set_blocking(false);
 

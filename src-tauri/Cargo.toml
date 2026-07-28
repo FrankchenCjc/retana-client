@@ -1,0 +1,42 @@
+[package]
+name = "retana"
+version = "0.1.0"
+description = "retana - a local Hermes frontend client"
+authors = ["retana"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3" }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.3", features = ["tray-icon"] }
+anyhow = "1"
+tauri-plugin-log = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-process = "2"
+
+# SSH
+ssh2 = "0.9"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# YAML config
+serde_yaml = "0.9"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID for message IDs
+uuid = { version = "1", features = ["v4"] }

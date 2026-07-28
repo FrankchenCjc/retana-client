@@ -70,49 +70,51 @@ impl CronService {
         self.history.lock().unwrap().clone()
     }
 
-    /// Start the cron scheduler loop
+    /// Start the cron scheduler loop (spawns its own OS thread with a Tokio runtime)
     pub fn start(&self) {
         let tasks = Arc::clone(&self.tasks);
         let history = Arc::clone(&self.history);
 
-        tokio::spawn(async move {
-            loop {
-                // Scope the lock so it's dropped before .await
-                {
-                    let now = Utc::now();
-                    let mut task_list = tasks.lock().unwrap();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create cron Tokio runtime");
+            rt.block_on(async move {
+                loop {
+                    {
+                        let now = Utc::now();
+                        let mut task_list = tasks.lock().unwrap();
 
-                    for task in task_list.iter_mut() {
-                        if !task.enabled {
-                            continue;
-                        }
-
-                        let should_run = match &task.last_run {
-                            None => true,
-                            Some(last) => {
-                                let interval = Self::parse_interval(&task.schedule);
-                                let elapsed = (now - *last).num_seconds();
-                                elapsed >= interval
+                        for task in task_list.iter_mut() {
+                            if !task.enabled {
+                                continue;
                             }
-                        };
 
-                        if should_run {
-                            log::info!("Running scheduled task: {}", task.name);
-                            task.last_run = Some(now);
+                            let should_run = match &task.last_run {
+                                None => true,
+                                Some(last) => {
+                                    let interval = Self::parse_interval(&task.schedule);
+                                    let elapsed = (now - *last).num_seconds();
+                                    elapsed >= interval
+                                }
+                            };
 
-                            history.lock().unwrap().push(TaskResult {
-                                task_id: task.id.clone(),
-                                timestamp: now,
-                                success: true,
-                                output: format!("Task {} executed", task.name),
-                                exit_code: Some(0),
-                            });
+                            if should_run {
+                                log::info!("Running scheduled task: {}", task.name);
+                                task.last_run = Some(now);
+
+                                history.lock().unwrap().push(TaskResult {
+                                    task_id: task.id.clone(),
+                                    timestamp: now,
+                                    success: true,
+                                    output: format!("Task {} executed", task.name),
+                                    exit_code: Some(0),
+                                });
+                            }
                         }
                     }
-                } // MutexGuard dropped here
 
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            });
         });
     }
 

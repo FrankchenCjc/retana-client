@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-retana-bridge — Hermes ↔ retana WebSocket 桥接
+retana-bridge — Hermes ↔ retana WebSocket Server
 
-运行在 Hermes 服务器上。Hermes API Server 通过 SSH 反向隧道
-连接到 retana 的 WebSocket 端点，实现双向实时聊天。
+运行在 Hermes 服务器上。retana 客户端直接通过 WebSocket 连接。
+不需要 SSH 反向隧道。
 
 协议 (WebSocket JSON):
 
-retana → Hermes:
+retana → bridge:
   {"type": "chat", "content": "...", "sender": "user"}
   {"type": "tool_result", "task_id": "...", "output": "...", "exit_code": 0}
 
-Hermes → retana:
+bridge → retana:
   {"type": "chat", "content": "...", "sender": "hermes"}
   {"type": "tool_progress", "label": "...", "tool_type": "tool_call", "status": "running"}
-  {"type": "tool_call", "task_id": "...", "command": "...", "label": "执行命令"}
+  {"type": "tool_call", "task_id": "...", "command": "...", "label": "..."}
 
 用法:
-  HERMES_API_URL=http://localhost:8642/v1 \
-  HERMES_API_KEY=change-me-local-dev \
-  python3 retana-bridge.py [ws_url]
-
-默认 ws_url = ws://localhost:9000 (通过 SSH 反向隧道)
+  python3 retana-bridge.py [host] [port]
+  默认: 0.0.0.0:9001
 """
 
 import asyncio
@@ -29,46 +26,49 @@ import json
 import os
 import sys
 import traceback
-import uuid
-from typing import Optional
 
-import aiohttp  # pip install aiohttp
+import aiohttp
+from aiohttp import web
 
 # ─── 配置 ───
 
-WS_URL = sys.argv[1] if len(sys.argv) > 1 else "ws://localhost:9000"
+HOST = sys.argv[1] if len(sys.argv) > 1 else "0.0.0.0"
+PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 9001
 HERMES_API_URL = os.environ.get("HERMES_API_URL", "http://localhost:8642/v1")
-HERMES_API_KEY="retana-bridge-dev-key-2026"
 
+# 从 .env 读 key
+_api_key = None
+env_path = os.path.expanduser("~/.hermes/.env")
+try:
+    with open(env_path) as f:
+        for line in f:
+            if line.startswith("API_SERVER_KEY="):
+                _api_key = line.split("=", 1)[1].strip()
+                break
+except Exception:
+    pass
+HERMES_API_KEY= _api_key or "change-me-local-dev"
 
-# ─── 消息处理 ───
+# ─── WebSocket 管理 ───
 
-class Bridge:
+class BridgeServer:
     def __init__(self):
-        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self.pending_tools: dict[str, asyncio.Future] = {}
+        self.clients: set[web.WebSocketResponse] = set()
 
-    async def connect_ws(self):
-        """连接到 retana WebSocket（通过 SSH 隧道）"""
-        while True:
+    async def broadcast(self, msg: dict):
+        """发送 JSON 给所有连接的 retana 客户端"""
+        dead = set()
+        for ws in self.clients:
             try:
-                print(f"[bridge] 连接 {WS_URL} ...", file=sys.stderr)
-                session = aiohttp.ClientSession()
-                self.ws = await session.ws_connect(WS_URL)
-                print(f"[bridge] ✅ 已连接", file=sys.stderr)
-                return session
-            except Exception as e:
-                print(f"[bridge] ❌ 连接失败: {e}，3秒后重试", file=sys.stderr)
-                await asyncio.sleep(3)
-
-    async def send_to_retana(self, msg: dict):
-        """发送 JSON 消息到 retana"""
-        if self.ws and not self.ws.closed:
-            await self.ws.send_json(msg)
-            print(f"[bridge] → retana: {json.dumps(msg, ensure_ascii=False)[:200]}", file=sys.stderr)
+                await ws.send_json(msg)
+            except Exception:
+                dead.add(ws)
+        self.clients -= dead
+        if dead:
+            print(f"[bridge] 清理了 {len(dead)} 个断开的客户端", file=sys.stderr)
 
     async def handle_chat(self, content: str):
-        """把用户消息发给 Hermes API，流式响应发回 retana"""
+        """用户消息 → Hermes API 流式 → 广播回复"""
         headers = {
             "Authorization": f"Bearer {HERMES_API_KEY}",
             "Content-Type": "application/json",
@@ -88,9 +88,9 @@ class Bridge:
                 ) as resp:
                     if resp.status != 200:
                         text = await resp.text()
-                        await self.send_to_retana({
+                        await self.broadcast({
                             "type": "chat",
-                            "content": f"❌ Hermes API 错误 {resp.status}: {text[:500]}",
+                            "content": f"❌ API 错误 {resp.status}",
                             "sender": "system",
                         })
                         return
@@ -101,7 +101,6 @@ class Bridge:
                         if not line.startswith("data: "):
                             continue
                         data_str = line[6:]
-
                         if data_str == "[DONE]":
                             break
 
@@ -110,11 +109,10 @@ class Bridge:
                         except json.JSONDecodeError:
                             continue
 
-                        # 检查是否是 Hermes 自定义事件 (tool progress)
+                        # Hermes tool progress 事件
                         if data.get("type") == "hermes.tool.progress":
                             label = data.get("label", "working...")
-                            # 发送 tool_progress 给 retana
-                            await self.send_to_retana({
+                            await self.broadcast({
                                 "type": "tool_progress",
                                 "label": label,
                                 "tool_type": "tool_call",
@@ -122,7 +120,7 @@ class Bridge:
                             })
                             continue
 
-                        # 标准 OpenAI 流式 chunk
+                        # 标准 OpenAI chunk
                         choices = data.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
@@ -130,9 +128,8 @@ class Bridge:
                             if chunk_content:
                                 full_content += chunk_content
 
-                    # 流结束后，发送完整回复
                     if full_content.strip():
-                        await self.send_to_retana({
+                        await self.broadcast({
                             "type": "chat",
                             "content": full_content.strip(),
                             "sender": "hermes",
@@ -140,98 +137,88 @@ class Bridge:
 
         except Exception as e:
             traceback.print_exc()
-            await self.send_to_retana({
+            await self.broadcast({
                 "type": "chat",
-                "content": f"❌ 桥接错误: {str(e)}",
+                "content": f"❌ 桥接错误: {e}",
                 "sender": "system",
             })
 
-    async def handle_tool_call(self, msg: dict):
-        """
-        Hermes 想让 retana 执行命令（通过 tool_call 消息）。
-        retana 执行后发回 tool_result。
-        这里只是记录 pending，实际执行由 retana 完成。
-        """
-        task_id = msg.get("task_id", str(uuid.uuid4())[:8])
-        command = msg.get("command", "")
-        label = msg.get("label", "execute")
+    async def ws_handler(self, request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        self.clients.add(ws)
+        peer = request.remote
+        print(f"[bridge] ✅ retana 已连接: {peer}", file=sys.stderr)
 
-        print(f"[bridge] 工具调用 [{task_id}]: {label} — {command[:100]}", file=sys.stderr)
-
-        # 这个 task 等待 retana 的 tool_result
-        loop = asyncio.get_event_loop()
-        fut = loop.create_future()
-        self.pending_tools[task_id] = fut
-
-        # 同时通知 Hermes（如果 Hermes 在等 tool result）
-        # 这里不做额外处理，retana 执行完后会发 tool_result
-
-    async def handle_tool_result(self, msg: dict):
-        """retana 汇报命令执行结果"""
-        task_id = msg.get("task_id", "")
-        output = msg.get("output", "")
-        exit_code = msg.get("exit_code", 0)
-
-        print(f"[bridge] 工具结果 [{task_id}]: exit={exit_code}", file=sys.stderr)
-
-        if task_id in self.pending_tools:
-            self.pending_tools[task_id].set_result(msg)
-
-    async def run(self):
-        """主循环：接收 WS 消息 → 处理"""
-        session = await self.connect_ws()
+        # 通知所有客户端有新连接
+        await self.broadcast({
+            "type": "chat",
+            "content": f"🟢 retana 已接入 Hermes",
+            "sender": "system",
+        })
 
         try:
-            async for msg in self.ws:
+            async for msg in ws:
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     try:
                         data = json.loads(msg.data)
                     except json.JSONDecodeError:
-                        print(f"[bridge] 非JSON: {msg.data[:200]}", file=sys.stderr)
                         continue
 
                     msg_type = data.get("type", "")
 
                     if msg_type == "chat" and data.get("sender") == "user":
-                        # 用户消息 → 发给 Hermes
                         asyncio.create_task(self.handle_chat(data.get("content", "")))
 
                     elif msg_type == "tool_result":
-                        await self.handle_tool_result(data)
-
-                    elif msg_type == "chat" and data.get("sender") == "hermes":
-                        # Hermes 直接发的消息（不通过本桥接）→ 忽略
-                        pass
+                        # retana 汇报本机命令执行结果
+                        print(f"[bridge] tool_result: {data.get('task_id','?')} ok={data.get('success')}", file=sys.stderr)
 
                     else:
-                        print(f"[bridge] 未知消息: {msg_type}", file=sys.stderr)
+                        pass  # 忽略
 
-                elif msg.type == aiohttp.WSMsgType.CLOSED:
-                    print("[bridge] WebSocket 关闭", file=sys.stderr)
-                    break
                 elif msg.type == aiohttp.WSMsgType.ERROR:
-                    print(f"[bridge] WS 错误", file=sys.stderr)
-                    break
+                    print(f"[bridge] WS error: {ws.exception()}", file=sys.stderr)
 
         except Exception as e:
-            traceback.print_exc()
+            print(f"[bridge] WS 异常: {e}", file=sys.stderr)
         finally:
-            await session.close()
-            # 重连
-            print("[bridge] 重新连接...", file=sys.stderr)
-            await asyncio.sleep(3)
-            await self.run()
+            self.clients.discard(ws)
+            print(f"[bridge] retana 已断开: {peer}", file=sys.stderr)
+            await self.broadcast({
+                "type": "chat",
+                "content": "🔴 retana 已断开",
+                "sender": "system",
+            })
+
+        return ws
 
 
 async def main():
-    bridge = Bridge()
-    await bridge.run()
+    server = BridgeServer()
+    app = web.Application()
+    app.router.add_get("/ws", server.ws_handler)
+
+    # 健康检查
+    async def health(_request):
+        return web.json_response({"status": "ok", "clients": len(server.clients)})
+    app.router.add_get("/health", health)
+
+    print(f"═" * 50, file=sys.stderr)
+    print(f"retana-bridge WS Server", file=sys.stderr)
+    print(f"  监听: ws://{HOST}:{PORT}/ws", file=sys.stderr)
+    print(f"  API:  {HERMES_API_URL}", file=sys.stderr)
+    print(f"═" * 50, file=sys.stderr)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+    print(f"[bridge] ✅ 服务已启动", file=sys.stderr)
+
+    # 永远运行
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    print("═" * 50, file=sys.stderr)
-    print("retana-bridge — Hermes ↔ retana", file=sys.stderr)
-    print(f"  WS: {WS_URL}", file=sys.stderr)
-    print(f"  API: {HERMES_API_URL}", file=sys.stderr)
-    print("═" * 50, file=sys.stderr)
     asyncio.run(main())

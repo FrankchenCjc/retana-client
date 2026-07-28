@@ -6,7 +6,7 @@ import MessageInput from './components/MessageInput';
 import type { Message, SshConnection, CronTask } from './types';
 import './App.css';
 
-const WS_URL = 'ws://localhost:9000';
+const WS_URL = 'ws://115.159.116.195:9001/ws';
 
 function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);

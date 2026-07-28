@@ -5,27 +5,7 @@ import MessageInput from './components/MessageInput';
 import type { Message, SshConnection, CronTask } from './types';
 import './App.css';
 
-// Mock connections for now
-const DEFAULT_CONNECTIONS: SshConnection[] = [
-  {
-    id: '1',
-    name: 'home-server',
-    host: '192.168.1.100',
-    port: 22,
-    username: 'ubuntu',
-    status: 'disconnected',
-  },
-];
-
-const DEFAULT_CRON: CronTask[] = [
-  {
-    id: 'c1',
-    name: 'Health Check',
-    command: 'curl -s http://localhost:8080/health',
-    schedule: '5m',
-    enabled: false,
-  },
-];
+const WS_URL = 'ws://localhost:9000';
 
 function generateId(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -35,23 +15,148 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([
     {
       id: '0',
-      content: 'retana 已启动 ✨ 连接一个 Hermes 实例开始聊天吧~',
+      content: 'retana 已启动 ✨ 等待 Hermes 连接...',
       sender: 'system',
       timestamp: Date.now(),
     },
   ]);
-  const [connections, setConnections] = useState<SshConnection[]>(DEFAULT_CONNECTIONS);
+  const [connections, setConnections] = useState<SshConnection[]>([]);
   const [activeConnectionId, setActiveConnectionId] = useState<string | null>(null);
-  const [cronTasks, setCronTasks] = useState<CronTask[]>(DEFAULT_CRON);
+  const [cronTasks, setCronTasks] = useState<CronTask[]>([]);
   const [activeTab, setActiveTab] = useState<'chat' | 'cron' | 'memory'>('chat');
-  const [isConnected, setIsConnected] = useState(false);
+  const [wsConnected, setWsConnected] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Connect to local WebSocket server (Hermes reaches this via reverse tunnel)
+  useEffect(() => {
+    let reconnectTimer: ReturnType<typeof setTimeout>;
+
+    function connect() {
+      const ws = new WebSocket(WS_URL);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setWsConnected(true);
+        setMessages(prev => [
+          ...prev,
+          {
+            id: generateId(),
+            content: '🟢 本地端点已就绪',
+            sender: 'system',
+            timestamp: Date.now(),
+          },
+        ]);
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          handleServerMessage(data);
+        } catch {
+          // Non-JSON message — display as plain text
+          setMessages(prev => [
+            ...prev,
+            {
+              id: generateId(),
+              content: event.data,
+              sender: 'hermes',
+              timestamp: Date.now(),
+            },
+          ]);
+        }
+      };
+
+      ws.onclose = () => {
+        setWsConnected(false);
+        setMessages(prev => [
+          ...prev,
+          {
+            id: generateId(),
+            content: '🔴 本地端点断开，3秒后重连...',
+            sender: 'system',
+            timestamp: Date.now(),
+          },
+        ]);
+        reconnectTimer = setTimeout(connect, 3000);
+      };
+
+      ws.onerror = () => {
+        // onclose will fire after this
+      };
+    }
+
+    connect();
+
+    return () => {
+      clearTimeout(reconnectTimer);
+      wsRef.current?.close();
+    };
+  }, []);
+
+  const handleServerMessage = useCallback((data: Record<string, unknown>) => {
+    const msgType = data.type as string | undefined;
+
+    if (msgType === 'tool_progress') {
+      // Hermes is performing an operation
+      const op = {
+        id: generateId(),
+        type: (data.tool_type as 'thinking' | 'tool_call' | 'tool_result' | 'error') || 'tool_call',
+        label: (data.label as string) || 'working...',
+        detail: data.detail as string | undefined,
+        status: (data.status as 'running' | 'done' | 'error') || 'running',
+      };
+
+      setMessages(prev => {
+        // Update or create a message with operations
+        const lastMsg = prev[prev.length - 1];
+        if (lastMsg && lastMsg.sender === 'hermes' && lastMsg.operations) {
+          // Update existing operation
+          const existingOp = lastMsg.operations.find(o => o.label === op.label);
+          if (existingOp) {
+            return prev.map(m =>
+              m.id === lastMsg.id
+                ? { ...m, operations: m.operations?.map(o => (o.label === op.label ? op : o)) }
+                : m
+            );
+          }
+          // Add new operation
+          return prev.map(m =>
+            m.id === lastMsg.id
+              ? { ...m, operations: [...(m.operations || []), op] }
+              : m
+          );
+        }
+        // Create new operation message
+        return [
+          ...prev,
+          {
+            id: generateId(),
+            content: '',
+            sender: 'hermes' as const,
+            timestamp: Date.now(),
+            operations: [op],
+          },
+        ];
+      });
+    } else {
+      // Regular chat message from Hermes (or system)
+      const msg: Message = {
+        id: generateId(),
+        content: (data.content as string) || '',
+        sender: (data.sender as 'user' | 'hermes' | 'system') || 'hermes',
+        timestamp: Date.now(),
+      };
+      setMessages(prev => [...prev, msg]);
+    }
+  }, []);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
   const handleSend = useCallback((text: string) => {
+    // Show user message immediately
     const userMsg: Message = {
       id: generateId(),
       content: text,
@@ -60,51 +165,25 @@ export default function App() {
     };
     setMessages(prev => [...prev, userMsg]);
 
-    // Simulate Hermes response with operations
-    if (isConnected) {
-      const thinkingOp = {
-        id: generateId(),
-        type: 'thinking' as const,
-        label: '思考中…',
-        status: 'running' as const,
-      };
-
-      const thinkingMsg: Message = {
-        id: generateId(),
-        content: '',
-        sender: 'hermes',
-        timestamp: Date.now(),
-        operations: [thinkingOp],
-      };
-      setMessages(prev => [...prev, thinkingMsg]);
-
-      // Simulate response after delay
-      setTimeout(() => {
-        setMessages(prev =>
-          prev.map(m =>
-            m.id === thinkingMsg.id
-              ? {
-                  ...m,
-                  content: `收到你的消息: "${text}" — 这是来自 Hermes 的模拟回复~ (◕‿◕)`,
-                  operations: m.operations?.map(op => ({ ...op, status: 'done' as const })),
-                }
-              : m
-          )
-        );
-      }, 1500);
+    // Send via WebSocket to local server → Hermes through tunnel
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'chat',
+        content: text,
+        sender: 'user',
+      }));
     } else {
-      // Not connected
-      setTimeout(() => {
-        const sysMsg: Message = {
+      setMessages(prev => [
+        ...prev,
+        {
           id: generateId(),
-          content: '⚠ 尚未连接到 Hermes 实例。请先在侧边栏连接 SSH。',
+          content: '⚠ 本地端点未连接。请确认 Hermes 通过反向隧道已接入。',
           sender: 'system',
           timestamp: Date.now(),
-        };
-        setMessages(prev => [...prev, sysMsg]);
-      }, 300);
+        },
+      ]);
     }
-  }, [isConnected]);
+  }, []);
 
   const handleConnect = useCallback((id: string) => {
     setConnections(prev =>
@@ -114,24 +193,25 @@ export default function App() {
     );
     setActiveConnectionId(id);
 
+    // TODO: wire to actual SSH connect via Tauri invoke
     setTimeout(() => {
       setConnections(prev =>
         prev.map(c =>
           c.id === id ? { ...c, status: 'connected' } : c
         )
       );
-      setIsConnected(true);
-      setActiveConnectionId(id);
 
-      const sysMsg: Message = {
-        id: generateId(),
-        content: `已连接到 ${connections.find(c => c.id === id)?.name || 'Hermes'} ✅`,
-        sender: 'system',
-        timestamp: Date.now(),
-      };
-      setMessages(prev => [...prev, sysMsg]);
-    }, 1000);
-  }, [connections]);
+      setMessages(prev => [
+        ...prev,
+        {
+          id: generateId(),
+          content: `SSH 隧道已建立 — 远程端口已转发到本地`,
+          sender: 'system',
+          timestamp: Date.now(),
+        },
+      ]);
+    }, 1500);
+  }, []);
 
   const handleDisconnect = useCallback((id: string) => {
     setConnections(prev =>
@@ -139,22 +219,23 @@ export default function App() {
         c.id === id ? { ...c, status: 'disconnected' } : c
       )
     );
-    setIsConnected(false);
 
-    const sysMsg: Message = {
-      id: generateId(),
-      content: '已断开连接',
-      sender: 'system',
-      timestamp: Date.now(),
-    };
-    setMessages(prev => [...prev, sysMsg]);
+    setMessages(prev => [
+      ...prev,
+      {
+        id: generateId(),
+        content: 'SSH 隧道已断开',
+        sender: 'system',
+        timestamp: Date.now(),
+      },
+    ]);
   }, []);
 
   const handleAddConnection = useCallback(() => {
     const newConn: SshConnection = {
       id: generateId(),
-      name: `server-${connections.length + 1}`,
-      host: 'localhost',
+      name: `hermes-${connections.length + 1}`,
+      host: 'your-server.com',
       port: 22,
       username: 'user',
       status: 'disconnected',
@@ -185,16 +266,14 @@ export default function App() {
       <div className="main-chat">
         <div className="chat-header">
           <div className="connection-status">
-            <span className={`status-dot ${isConnected ? 'status-connected' : 'status-disconnected'}`} />
+            <span className={`status-dot ${wsConnected ? 'status-connected' : 'status-disconnected'}`} />
             <span>
-              {isConnected
-                ? `已连接 — ${connections.find(c => c.id === activeConnectionId)?.name || 'Hermes'}`
-                : '未连接'}
+              {wsConnected
+                ? '本地端点已就绪 — 等待 Hermes 接入'
+                : '本地端点未连接'}
             </span>
           </div>
-          {isConnected && (
-            <span className="ssh-badge">SSH</span>
-          )}
+          <span className="ssh-badge">WS</span>
         </div>
         <div className="messages-container">
           {messages.map(msg => (
@@ -205,9 +284,9 @@ export default function App() {
         <MessageInput
           onSend={handleSend}
           placeholder={
-            isConnected
+            wsConnected
               ? '输入消息... (Enter 发送)'
-              : '请先连接 SSH...'
+              : '等待本地端点就绪...'
           }
         />
       </div>

@@ -133,8 +133,8 @@ pub fn run() {
     });
     log::info!("Local WS server on port {}, proxying to {}", server_port, url_for_log);
 
-    // Auto-connect SSH + reverse tunnel
-    auto_connect(Arc::clone(&ssh_manager), Arc::clone(&shutdown));
+    // SSH auto-connect disabled — WS proxy handles everything
+    // auto_connect(Arc::clone(&ssh_manager), Arc::clone(&shutdown));
 
     let app_state = AppState {
         ssh: ssh_manager,

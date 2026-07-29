@@ -262,6 +262,7 @@ html, body, #root {
 .messages-container {
   flex: 1;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 16px;
   display: flex;
   flex-direction: column;
@@ -359,6 +360,8 @@ html, body, #root {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .message-bubble {
@@ -367,6 +370,8 @@ html, body, #root {
   font-size: 14px;
   line-height: 1.5;
   word-break: break-word;
+  overflow-wrap: anywhere;
+  overflow: hidden;
 }
 
 .bubble-user {
@@ -381,6 +386,9 @@ html, body, #root {
 
 .message-text {
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  overflow: hidden;
 }
 
 .message-time {

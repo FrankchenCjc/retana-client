@@ -18,23 +18,23 @@ use tokio_tungstenite::tungstenite::Message;
 /// Execute a local command and return structured result
 fn exec_local(cmd: &str) -> serde_json::Value {
     let output = if cfg!(target_os = "windows") {
-        // PowerShell with forced UTF-8 — more reliable than cmd chcp 65001
-        // because it sets encoding at the .NET level for all child processes
-        let ps_cmd = format!(
-            "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8;{}",
-            cmd
-        );
-        Command::new("powershell")
-            .args(["-NoProfile", "-Command", &ps_cmd])
-            .output()
+        // cmd /U = UTF-16LE output for internal commands (dir, type, etc.)
+        // chcp 65001 = UTF-8 for external commands — belt and suspenders
+        let effective = format!("chcp 65001 > nul & {}", cmd);
+        Command::new("cmd").args(["/U", "/C", &effective]).output()
     } else {
         Command::new("sh").args(["-c", cmd]).output()
     };
     match output {
         Ok(o) => {
-            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
-            let combined = if stdout.is_empty() { stderr } else { stdout };
+            // cmd /U produces UTF-16LE — decode accordingly
+            let decoded = if cfg!(target_os = "windows") {
+                decode_cmd_output(&o.stdout, &o.stderr)
+            } else {
+                (String::from_utf8_lossy(&o.stdout).to_string(),
+                 String::from_utf8_lossy(&o.stderr).to_string())
+            };
+            let combined = if decoded.0.is_empty() { decoded.1 } else { decoded.0 };
             // Clean control chars (except newline/tab) that can break JSON
             let cleaned: String = combined.chars().map(|c| {
                 if c.is_control() && c != '\n' && c != '\t' { ' ' } else { c }
@@ -51,6 +51,30 @@ fn exec_local(cmd: &str) -> serde_json::Value {
             "success": false
         }),
     }
+}
+
+/// Decode cmd /U (UTF-16LE) output, with UTF-8 fallback
+fn decode_cmd_output(stdout: &[u8], stderr: &[u8]) -> (String, String) {
+    (decode_best_effort(stdout), decode_best_effort(stderr))
+}
+
+fn decode_best_effort(bytes: &[u8]) -> String {
+    // Try UTF-16LE first (cmd /U output)
+    if bytes.len() >= 2 {
+        let u16s: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let s = String::from_utf16_lossy(&u16s);
+        // If it looks reasonable (not full of replacement chars), keep it
+        let replacement_ratio = s.chars().filter(|&c| c == '\u{FFFD}').count() as f32
+            / s.chars().count().max(1) as f32;
+        if replacement_ratio < 0.5 {
+            return s.trim_end_matches('\0').to_string();
+        }
+    }
+    // Fallback: try UTF-8
+    String::from_utf8_lossy(bytes).to_string()
 }
 
 /// Smart truncation: head 2 lines + "... N lines omitted ..." + tail 2 lines

@@ -194,16 +194,21 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
         msgs.append({"role": "assistant", "content": reply})
         execs = re.findall(r'\[EXEC:(.+?)\]', reply)
         if execs:
+            print(f"🔧 EXEC found: {execs}", file=sys.stderr)
             for cmd in execs:
                 cmd = cmd.strip()
                 tid = str(uuid.uuid4())[:8]
+                print(f"🔧 → sending tool_call: {cmd[:80]}", file=sys.stderr)
                 await s.bc({"type": "tool_call", "task_id": tid, "command": cmd, "label": cmd[:60]})
                 fut = asyncio.get_event_loop().create_future()
                 s.pe[tid] = fut
                 try:
                     result = await asyncio.wait_for(fut, timeout=30)
+                    print(f"🔧 ← result: success={result.get('success')}, len={len(result.get('output',''))}",
+                          file=sys.stderr)
                 except asyncio.TimeoutError:
-                    result = {"output": "timeout", "exit_code": -1}
+                    print(f"🔧 ← TIMEOUT after 30s", file=sys.stderr)
+                    result = {"output": "timeout", "exit_code": -1, "success": False}
                 s.pe.pop(tid, None)
                 ok = "OK" if result.get("success") else f"exit={result.get('exit_code', -1)}"
                 msgs.append({"role": "user", "content": f"[EXEC:{cmd}] {ok}:\n{s._trunc(result.get('output', ''), max_chars=16000)}"})
@@ -211,6 +216,11 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
             if reply2:
                 reply = reply2
                 msgs.append({"role": "assistant", "content": reply})
+            else:
+                print(f"🔧 WARNING: reply2 was empty, stripping EXEC markers", file=sys.stderr)
+                reply = re.sub(r'\[EXEC:.+?\]', '[command executed]', reply)
+        # Safety net: always strip any remaining EXEC markers before showing user
+        reply = re.sub(r'\[EXEC:.+?\]', '', reply).strip()
         if reply:
             await s.bc({"type": "chat", "content": reply, "sender": "hermes"})
         # Save history (trim to last 50 messages to avoid context overflow)

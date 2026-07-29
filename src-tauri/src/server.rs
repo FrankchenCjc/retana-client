@@ -121,7 +121,8 @@ async fn encrypted_bridge_proxy(
                                 let t = v.get("type").and_then(|t| t.as_str());
                                 let s = v.get("sender").and_then(|s| s.as_str());
                                 t == Some("chat") && s == Some("user")
-                                    || t == Some("env_info")  // forward env info too
+                                    || t == Some("env_info")   // forward env info too
+                                    || t == Some("tool_result")  // forward command execution results
                             })
                             .unwrap_or(false);
                         if forward {

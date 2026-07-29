@@ -56,6 +56,7 @@ class B:
         s.pe = {}
         s.eph = {}
         s.env = {}      # per-connection env_info: ws → {os, arch, shell, hostname}
+        s.hist = {}     # per-connection conversation history: ws → [{role, content}]
         s._sk = BRIDGE_SK  # mutable for key rotation
 
     @property
@@ -164,7 +165,12 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
             return f"Err: {e}"
 
     async def hc(s, content, ws):
-        msgs = [{"role": "system", "content": s._sys_prompt(ws)}, {"role": "user", "content": content}]
+        # Build messages with conversation history
+        history = s.hist.get(ws, [])
+        if not history:
+            # First message: prepend system prompt
+            history = [{"role": "system", "content": s._sys_prompt(ws)}]
+        msgs = history + [{"role": "user", "content": content}]
         reply = await s.ch(msgs)
         msgs.append({"role": "assistant", "content": reply})
         execs = re.findall(r'\[EXEC:(.+?)\]', reply)
@@ -183,9 +189,13 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
                 ok = "OK" if result.get("success") else f"exit={result.get('exit_code', -1)}"
                 msgs.append({"role": "user", "content": f"[EXEC:{cmd}] {ok}:\n{result.get('output', '')[:4000]}"})
             reply2 = await s.ch(msgs)
-            if reply2: reply = reply2
+            if reply2:
+                reply = reply2
+                msgs.append({"role": "assistant", "content": reply})
         if reply:
             await s.bc({"type": "chat", "content": reply, "sender": "hermes"})
+        # Save history (trim to last 50 messages to avoid context overflow)
+        s.hist[ws] = msgs[-50:]
 
     async def wh(s, req):
         ws = web.WebSocketResponse()
@@ -221,6 +231,7 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
             s.cs.discard(ws)
             s.eph.pop(ws, None)
             s.env.pop(ws, None)
+            s.hist.pop(ws, None)
         return ws
 
     def _handle_binary(s, data, ws):

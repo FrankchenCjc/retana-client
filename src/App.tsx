@@ -118,7 +118,13 @@ export default function App() {
   const lastMessageRef = useRef<{ content: string; sender: string; timestamp: number } | null>(null);
 
   const handleServerMessage = useCallback((data: Record<string, unknown>) => {
-    const msgType = data.type as string | undefined;
+    let msgType = data.type as string | undefined;
+
+    // Bridge sends "tp" as shorthand for tool_progress — normalize it
+    if (msgType === 'tp') {
+      msgType = 'tool_progress';
+      data = { ...data, type: 'tool_progress' };
+    }
 
     // Deduplicate: skip if same content/sender arrived within 1 second
     if (msgType !== 'tool_progress' && msgType !== 'tool_call') {

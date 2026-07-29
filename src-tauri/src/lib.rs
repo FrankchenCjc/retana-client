@@ -1,4 +1,3 @@
-mod cert;
 mod commands;
 mod config;
 mod cron;
@@ -106,8 +105,6 @@ fn auto_connect(ssh_manager: Arc<ssh::manager::SshManager>, shutdown: Arc<Atomic
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Trust the bundled bridge certificate for wss:// connections
-    cert::trust_bridge_cert();
     let ssh_manager = Arc::new(ssh::manager::SshManager::new(SshConfig {
         host: "localhost".into(),
         port: 22,
@@ -120,19 +117,20 @@ pub fn run() {
     let memory_store = Arc::new(Mutex::new(MemoryStore::load()));
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Start the local WebSocket server
+    // Start the local WebSocket server + bridge proxy
     let server_shutdown = Arc::clone(&shutdown);
     let server_port: u16 = 9000;
+    let bridge_url = "wss://115.159.116.195:9001/ws".to_string();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new()
             .expect("Failed to create server Tokio runtime");
         rt.block_on(async {
-            if let Err(e) = server::run_server(server_port, server_shutdown).await {
+            if let Err(e) = server::run_server(server_port, &bridge_url, server_shutdown).await {
                 log::error!("WebSocket server error: {}", e);
             }
         });
     });
-    log::info!("Local WebSocket server starting on port {}", server_port);
+    log::info!("Local WS server on port {}, proxying to {}", server_port, bridge_url);
 
     // Auto-connect SSH + reverse tunnel
     auto_connect(Arc::clone(&ssh_manager), Arc::clone(&shutdown));

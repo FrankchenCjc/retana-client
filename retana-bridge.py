@@ -137,7 +137,7 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
                 print(f"Key rotation error: {e}", file=sys.stderr)
 
     def _trunc(s, text, max_chars=4000):
-        """Smart truncation: head 2 lines + omitted count + tail 2 lines."""
+        """Smart truncation for UI display: head 2 lines + omitted count + tail 2 lines."""
         if len(text) <= max_chars:
             return text
         lines = text.split("\n")
@@ -199,7 +199,7 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
                     result = {"output": "timeout", "exit_code": -1}
                 s.pe.pop(tid, None)
                 ok = "OK" if result.get("success") else f"exit={result.get('exit_code', -1)}"
-                msgs.append({"role": "user", "content": f"[EXEC:{cmd}] {ok}:\n{s._trunc(result.get('output', ''))}"})
+                msgs.append({"role": "user", "content": f"[EXEC:{cmd}] {ok}:\n{s._trunc(result.get('output', ''), max_chars=16000)}"})
             reply2 = await s.ch(msgs)
             if reply2:
                 reply = reply2

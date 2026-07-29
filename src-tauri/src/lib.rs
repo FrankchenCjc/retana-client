@@ -121,6 +121,7 @@ pub fn run() {
     let server_shutdown = Arc::clone(&shutdown);
     let server_port: u16 = 9000;
     let bridge_url = "ws://115.159.116.195:9001/ws".to_string();
+    let url_for_log = bridge_url.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new()
             .expect("Failed to create server Tokio runtime");
@@ -130,7 +131,7 @@ pub fn run() {
             }
         });
     });
-    log::info!("Local WS server on port {}, proxying to {}", server_port, bridge_url);
+    log::info!("Local WS server on port {}, proxying to {}", server_port, url_for_log);
 
     // Auto-connect SSH + reverse tunnel
     auto_connect(Arc::clone(&ssh_manager), Arc::clone(&shutdown));

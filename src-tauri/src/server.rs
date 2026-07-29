@@ -7,7 +7,7 @@
 // Key rotation: bridge sends {"type":"key_rot","pubkey":"hex"} encrypted
 // with OLD key. Retana decrypts, switches to new key for subsequent messages.
 use futures_util::{SinkExt, StreamExt};
-use sodiumoxide::crypto::box_;
+use sodiumoxide::crypto::{box_, sealedbox};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
@@ -35,7 +35,7 @@ pub async fn run_server(port: u16, bridge_url: &str, shutdown: Arc<AtomicBool>) 
         tokio::select! {
             result = listener.accept() => {
                 match result {
-                    Ok((stream, peer)) => {
+                    Ok((stream, _peer)) => {
                         let tx = tx.clone();
                         let rx = tx.subscribe();
                         let shutdown = Arc::clone(&shutdown);
@@ -54,24 +54,15 @@ pub async fn run_server(port: u16, bridge_url: &str, shutdown: Arc<AtomicBool>) 
     Ok(())
 }
 
-/// Mutable bridge state: public key + precomputed box key
+/// Mutable bridge state: just the public key (rotates on key_rot)
 struct BridgeState {
     pk: box_::PublicKey,
-    precomputed: box_::PrecomputedKey,
 }
 
 impl BridgeState {
-    fn new(pk: box_::PublicKey, esk: &box_::SecretKey) -> Self {
-        let precomputed = box_::precompute(&pk, esk);
-        Self { pk, precomputed }
-    }
-    fn rotate(&mut self, new_pk: box_::PublicKey, esk: &box_::SecretKey) {
+    fn rotate(&mut self, new_pk: box_::PublicKey) {
         self.pk = new_pk;
-        self.precomputed = box_::precompute(&self.pk, esk);
-        log::info!(
-            "🔑 Key rotated → {}...",
-            hex::encode(&self.pk.as_ref()[..4])
-        );
+        log::info!("🔑 Key rotated → {}...", hex::encode(&self.pk.as_ref()[..4]));
     }
 }
 
@@ -114,14 +105,14 @@ async fn encrypted_bridge_proxy(
     };
 
     let (epk, esk) = box_::gen_keypair();
-    let state = Arc::new(Mutex::new(BridgeState::new(bridge_pk, &esk)));
+    let state = Arc::new(Mutex::new(BridgeState { pk: bridge_pk }));
 
     log::info!("🔗 Bridge proxy ready (NaCl, mutable key)");
     tx.send(r#"{"type":"chat","content":"🟢 本地端点已就绪","sender":"system"}"#.into()).ok();
 
     loop {
         tokio::select! {
-            // Frontend → Bridge: sealed box with current key
+            // Frontend → Bridge: SealedBox (one-way, no nonce needed)
             msg = rx.recv() => {
                 match msg {
                     Ok(text) => {
@@ -135,7 +126,7 @@ async fn encrypted_bridge_proxy(
                             let pk = { state.lock().unwrap().pk.clone() };
                             let mut payload = Vec::from(epk.as_ref());
                             payload.extend_from_slice(text.as_bytes());
-                            let sealed = box_::seal(&payload, &pk);
+                            let sealed = sealedbox::seal(&payload, &pk);
                             if ws.send(Message::Binary(sealed.into())).await.is_err() {
                                 log::error!("Bridge proxy: send failed");
                                 break;
@@ -147,7 +138,7 @@ async fn encrypted_bridge_proxy(
                 }
             }
 
-            // Bridge → Frontend: try decrypt with current key
+            // Bridge → Frontend: Box decrypt (nonce(24) || ciphertext)
             ws_msg = ws.next() => {
                 match ws_msg {
                     Some(Ok(Message::Binary(data))) => {
@@ -156,8 +147,8 @@ async fn encrypted_bridge_proxy(
                             Some(n) => n,
                             None => continue,
                         };
-                        let precomputed = { state.lock().unwrap().precomputed.clone() };
-                        match box_::open(&data[24..], &nonce, &precomputed) {
+                        let pk = { state.lock().unwrap().pk.clone() };
+                        match box_::open(&data[24..], &nonce, &pk, &esk) {
                             Ok(plain) => {
                                 if let Ok(text) = String::from_utf8(plain.clone()) {
                                     // Check for key rotation
@@ -166,9 +157,8 @@ async fn encrypted_bridge_proxy(
                                             if let Some(h) = v.get("pubkey").and_then(|p| p.as_str()) {
                                                 if let Ok(b) = hex::decode(h) {
                                                     if let Some(new_pk) = box_::PublicKey::from_slice(&b) {
-                                                        state.lock().unwrap().rotate(new_pk, &esk);
-                                                        log::info!("🔑 Key rotated per bridge directive");
-                                                        continue; // don't forward key_rot to frontend
+                                                        state.lock().unwrap().rotate(new_pk);
+                                                        continue;
                                                     }
                                                 }
                                             }
@@ -200,7 +190,7 @@ async fn encrypted_bridge_proxy(
             }
         }
     }
-    let _ = ws.close().await;
+    let _ = ws.close(None).await;
 }
 
 async fn handle_connection(
@@ -209,10 +199,9 @@ async fn handle_connection(
     mut rx: broadcast::Receiver<String>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".into());
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
-        Err(e) => { log::error!("WS handshake fail {}: {}", peer, e); return; }
+        Err(e) => { log::error!("WS handshake fail: {}", e); return; }
     };
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     loop {
@@ -229,7 +218,7 @@ async fn handle_connection(
             broadcast_msg = rx.recv() => {
                 match broadcast_msg {
                     Ok(msg) => { if ws_sender.send(Message::Text(msg.into())).await.is_err() { break; } }
-                    Err(broadcast::error::RecvError::Lagged(n)) => log::warn!("Client {} lagged {}", peer, n),
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -238,5 +227,5 @@ async fn handle_connection(
             }
         }
     }
-    let _ = ws_sender.close().await;
+    let _ = ws_sender.close(None).await;
 }

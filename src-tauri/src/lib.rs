@@ -1,3 +1,4 @@
+mod cert;
 mod commands;
 mod config;
 mod cron;
@@ -105,6 +106,8 @@ fn auto_connect(ssh_manager: Arc<ssh::manager::SshManager>, shutdown: Arc<Atomic
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Trust the bundled bridge certificate for wss:// connections
+    cert::trust_bridge_cert();
     let ssh_manager = Arc::new(ssh::manager::SshManager::new(SshConfig {
         host: "localhost".into(),
         port: 22,

@@ -251,9 +251,11 @@ async fn encrypted_bridge_proxy(
 
                                         // Intercept tool_call: execute locally, send result back to bridge
                                         if msg_type == Some("tool_call") {
-                                            let task_id = v.get("task_id").and_then(|t| t.as_str()).unwrap_or("");
-                                            let command = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                                            let label = v.get("label").and_then(|l| l.as_str()).unwrap_or(command);
+                                            let task_id = v.get("task_id").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                                            let command = v.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                                            let label = v.get("label").and_then(|l| l.as_str()).unwrap_or(&command).to_string();
+
+                                            log::info!("🔧 EXEC: {}", &command);
 
                                             // Notify frontend: execution started
                                             let start_msg = serde_json::json!({
@@ -264,8 +266,16 @@ async fn encrypted_bridge_proxy(
                                             });
                                             let _ = tx.send(start_msg.to_string());
 
-                                            // Execute locally (blocking — ok since this is in a spawned task)
-                                            let result = exec_local(command);
+                                            // Execute locally in thread pool (non-blocking for tokio)
+                                            let cmd = command.clone();
+                                            let result = match tokio::task::spawn_blocking(move || exec_local(&cmd)).await {
+                                                Ok(r) => r,
+                                                Err(e) => serde_json::json!({
+                                                    "output": format!("exec error: {}", e),
+                                                    "exit_code": -1,
+                                                    "success": false
+                                                }),
+                                            };
 
                                             // Send result back to bridge (encrypted)
                                             let result_msg = serde_json::json!({
@@ -286,12 +296,14 @@ async fn encrypted_bridge_proxy(
 
                                             // Notify frontend: done
                                             let done_status = if result["success"].as_bool().unwrap_or(false) { "done" } else { "error" };
+                                            let detail = truncate_detail(result["output"].as_str().unwrap_or(""));
+                                            log::info!("🔧 EXEC done [{}]: {}", done_status, &detail.lines().next().unwrap_or(""));
                                             let done_msg = serde_json::json!({
                                                 "type": "tool_progress",
                                                 "label": format!("📋 {}", label),
                                                 "tool_type": "tool_call",
                                                 "status": done_status,
-                                                "detail": truncate_detail(result["output"].as_str().unwrap_or(""))
+                                                "detail": detail
                                             });
                                             let _ = tx.send(done_msg.to_string());
                                             continue;

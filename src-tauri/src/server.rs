@@ -227,5 +227,5 @@ async fn handle_connection(
             }
         }
     }
-    let _ = ws_sender.close(None).await;
+    let _ = ws_sender.close().await;
 }

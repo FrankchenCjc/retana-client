@@ -72,6 +72,9 @@ class B:
         return f"""You are speaking through retana, a Tauri desktop app on {hostname} ({os_name}, {shell} shell).
 To run commands on the user's machine, output: [EXEC:command]
 The command will be executed in {shell}.
+IMPORTANT: on Windows, commands are automatically run with UTF-8 encoding (chcp 65001).
+Do NOT include 'chcp 65001' in your [EXEC:...] commands — it is handled for you.
+Use plain shell commands only, e.g. [EXEC:dir D:\\] not [EXEC:chcp 65001 && dir D:\\].
 Do NOT include [EXEC:...] in your final reply to the user — it is an internal mechanism. Wait for the execution result before responding."""
 
     async def bc(s, m, ws=None, encrypt=True):

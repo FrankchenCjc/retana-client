@@ -18,8 +18,13 @@ use tokio_tungstenite::tungstenite::Message;
 /// Execute a local command and return structured result
 fn exec_local(cmd: &str) -> serde_json::Value {
     let output = if cfg!(target_os = "windows") {
-        // chcp 65001 = UTF-8, fixes garbled Chinese in dir/type/etc output
-        Command::new("cmd").args(["/C", &format!("chcp 65001 > nul && {}", cmd)]).output()
+        // chcp 65001 = UTF-8, but skip if the command already sets it
+        let effective = if cmd.contains("chcp 65001") || cmd.contains("chcp  65001") {
+            cmd.to_string()
+        } else {
+            format!("chcp 65001 > nul && {}", cmd)
+        };
+        Command::new("cmd").args(["/C", &effective]).output()
     } else {
         Command::new("sh").args(["-c", cmd]).output()
     };

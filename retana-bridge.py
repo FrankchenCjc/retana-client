@@ -124,6 +124,8 @@ class B:
         ws = web.WebSocketResponse()
         await ws.prepare(req)
         s.cs.add(ws)
+        # Send current public key first (unencrypted, so retana can seal)
+        await ws.send_json({"type": "key", "pubkey": bytes(BRIDGE_PK).hex()})
         await s.bc({"type": "chat", "content": "retana connected", "sender": "system"}, encrypt=False)
 
         try:

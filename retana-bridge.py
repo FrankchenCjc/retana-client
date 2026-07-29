@@ -193,7 +193,9 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
         s.cs.add(ws)
         # Bootstrap: send current public key in plaintext (only for first connect)
         await ws.send_json({"type": "key", "pubkey": bytes(s.pk).hex()})
-        await s.bc({"type": "chat", "content": "retana connected", "sender": "system"}, encrypt=False)
+        # Only notify the new connection, not broadcast to all (avoids duplicate messages
+        # when stale connections linger in s.cs)
+        await ws.send_json({"type": "chat", "content": "retana connected", "sender": "system"})
 
         try:
             async for msg in ws:

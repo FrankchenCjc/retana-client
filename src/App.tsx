@@ -115,8 +115,24 @@ export default function App() {
     };
   }, []);
 
+  const lastMessageRef = useRef<{ content: string; sender: string; timestamp: number } | null>(null);
+
   const handleServerMessage = useCallback((data: Record<string, unknown>) => {
     const msgType = data.type as string | undefined;
+
+    // Deduplicate: skip if same content/sender arrived within 1 second
+    if (msgType !== 'tool_progress' && msgType !== 'tool_call') {
+      const content = (data.content as string) || '';
+      const sender = (data.sender as string) || '';
+      if (content && sender) {
+        const last = lastMessageRef.current;
+        if (last && last.content === content && last.sender === sender
+            && Math.abs(Date.now() - last.timestamp) < 1000) {
+          return; // duplicate, skip
+        }
+        lastMessageRef.current = { content, sender, timestamp: Date.now() };
+      }
+    }
 
     if (msgType === 'tool_progress') {
       // Hermes is performing an operation

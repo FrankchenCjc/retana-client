@@ -48,6 +48,26 @@ export default function App() {
             timestamp: Date.now(),
           },
         ]);
+
+        // Send environment info so Hermes knows the local platform
+        invoke<{ os: string; arch: string; hostname: string }>('system_info')
+          .then((info) => {
+            const shell =
+              info.os === 'windows' ? 'powershell' :
+              info.os === 'macos' ? 'zsh' : 'bash';
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(JSON.stringify({
+                type: 'env_info',
+                os: info.os,
+                arch: info.arch,
+                hostname: info.hostname,
+                shell,
+              }));
+            }
+          })
+          .catch(() => {
+            // system_info failed, Hermes will use generic prompt
+          });
       };
 
       ws.onmessage = (event) => {

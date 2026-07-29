@@ -50,22 +50,28 @@ BRIDGE_SK = _load_key()
 BRIDGE_PK = BRIDGE_SK.public_key
 _next_key_path = os.path.expanduser("~/.retana/bridge_nacl_next.key")
 
-SYS = """You are speaking through retana, a Tauri desktop app running on the user's local machine.
-To run commands on the user's machine, output: [EXEC:command]
-The command will be executed in the user's default shell (powershell on Windows, zsh/bash on macOS/Linux).
-Examples: [EXEC:dir C:\\Users] (Windows) or [EXEC:ls -la ~/Desktop] (macOS/Linux)
-Do NOT include [EXEC:...] in your final reply to the user — it is an internal mechanism. Wait for the execution result before responding."""
-
 class B:
     def __init__(s):
         s.cs = set()
         s.pe = {}
         s.eph = {}
+        s.env = {}      # per-connection env_info: ws → {os, arch, shell, hostname}
         s._sk = BRIDGE_SK  # mutable for key rotation
 
     @property
     def pk(s):
         return s._sk.public_key
+
+    def _sys_prompt(s, ws):
+        """Build system prompt from client's env_info."""
+        info = s.env.get(ws, {})
+        os_name = info.get("os", "unknown")
+        shell = info.get("shell", "bash")
+        hostname = info.get("hostname", "unknown")
+        return f"""You are speaking through retana, a Tauri desktop app on {hostname} ({os_name}, {shell} shell).
+To run commands on the user's machine, output: [EXEC:command]
+The command will be executed in {shell}.
+Do NOT include [EXEC:...] in your final reply to the user — it is an internal mechanism. Wait for the execution result before responding."""
 
     async def bc(s, m, ws=None, encrypt=True):
         """Broadcast to all clients. encrypt=True uses Box for each client."""
@@ -158,7 +164,7 @@ class B:
             return f"Err: {e}"
 
     async def hc(s, content, ws):
-        msgs = [{"role": "system", "content": SYS}, {"role": "user", "content": content}]
+        msgs = [{"role": "system", "content": s._sys_prompt(ws)}, {"role": "user", "content": content}]
         reply = await s.ch(msgs)
         msgs.append({"role": "assistant", "content": reply})
         execs = re.findall(r'\[EXEC:(.+?)\]', reply)
@@ -205,11 +211,14 @@ class B:
                         tid = d.get("task_id", "")
                         if tid in s.pe:
                             s.pe[tid].set_result(d)
+                    elif t == "env_info":
+                        s.env[ws] = {k: d.get(k, "") for k in ("os", "arch", "shell", "hostname")}
         except:
             pass
         finally:
             s.cs.discard(ws)
             s.eph.pop(ws, None)
+            s.env.pop(ws, None)
         return ws
 
     def _handle_binary(s, data, ws):

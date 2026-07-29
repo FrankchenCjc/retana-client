@@ -217,13 +217,23 @@ export default function App() {
       if (data.sender === 'user') {
         return;
       }
-      const msg: Message = {
-        id: generateId(),
-        content: (data.content as string) || '',
-        sender: (data.sender as 'user' | 'hermes' | 'system') || 'hermes',
-        timestamp: Date.now(),
-      };
-      setMessages(prev => [...prev, msg]);
+      const isHermesStream = data.sender === 'hermes' && !data.type;
+      setMessages(prev => {
+        // Streaming: update last hermes message in-place
+        if (isHermesStream) {
+          const last = prev[prev.length - 1];
+          if (last && last.sender === 'hermes' && !last.operations?.length) {
+            return [...prev.slice(0, -1), { ...last, content: (data.content as string) || '' }];
+          }
+        }
+        // Otherwise append new message
+        return [...prev, {
+          id: generateId(),
+          content: (data.content as string) || '',
+          sender: (data.sender as 'user' | 'hermes' | 'system') || 'hermes',
+          timestamp: Date.now(),
+        }];
+      });
     }
   }, []);
 

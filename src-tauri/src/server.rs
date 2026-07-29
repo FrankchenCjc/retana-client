@@ -118,8 +118,10 @@ async fn encrypted_bridge_proxy(
                     Ok(text) => {
                         let forward = serde_json::from_str::<serde_json::Value>(&text)
                             .map(|v| {
-                                v.get("sender").and_then(|s| s.as_str()) == Some("user")
-                                    && v.get("type").and_then(|t| t.as_str()) == Some("chat")
+                                let t = v.get("type").and_then(|t| t.as_str());
+                                let s = v.get("sender").and_then(|s| s.as_str());
+                                t == Some("chat") && s == Some("user")
+                                    || t == Some("env_info")  // forward env info too
                             })
                             .unwrap_or(false);
                         if forward {

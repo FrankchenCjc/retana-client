@@ -18,13 +18,15 @@ use tokio_tungstenite::tungstenite::Message;
 /// Execute a local command and return structured result
 fn exec_local(cmd: &str) -> serde_json::Value {
     let output = if cfg!(target_os = "windows") {
-        // chcp 65001 = UTF-8, but skip if the command already sets it
-        let effective = if cmd.contains("chcp 65001") || cmd.contains("chcp  65001") {
-            cmd.to_string()
-        } else {
-            format!("chcp 65001 > nul && {}", cmd)
-        };
-        Command::new("cmd").args(["/C", &effective]).output()
+        // PowerShell with forced UTF-8 — more reliable than cmd chcp 65001
+        // because it sets encoding at the .NET level for all child processes
+        let ps_cmd = format!(
+            "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8;{}",
+            cmd
+        );
+        Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps_cmd])
+            .output()
     } else {
         Command::new("sh").args(["-c", cmd]).output()
     };

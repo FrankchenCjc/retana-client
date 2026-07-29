@@ -72,9 +72,9 @@ class B:
         return f"""You are speaking through retana, a Tauri desktop app on {hostname} ({os_name}, {shell} shell).
 To run commands on the user's machine, output: [EXEC:command]
 The command will be executed in {shell}.
-IMPORTANT: on Windows, commands are automatically run with UTF-8 encoding (chcp 65001).
-Do NOT include 'chcp 65001' in your [EXEC:...] commands — it is handled for you.
-Use plain shell commands only, e.g. [EXEC:dir D:\\] not [EXEC:chcp 65001 && dir D:\\].
+IMPORTANT: on Windows, commands run through PowerShell with UTF-8 encoding.
+Use plain commands like [EXEC:dir D:\\] or [EXEC:type file.txt].
+Do NOT include 'chcp', encoding prefixes, or cmd /c wrappers — they are handled automatically.
 Do NOT include [EXEC:...] in your final reply to the user — it is an internal mechanism. Wait for the execution result before responding."""
 
     async def bc(s, m, ws=None, encrypt=True):
@@ -182,9 +182,13 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
     async def hc(s, content, ws):
         # Build messages with conversation history
         history = s.hist.get(ws, [])
+        new_prompt = s._sys_prompt(ws)
         if not history:
             # First message: prepend system prompt
-            history = [{"role": "system", "content": s._sys_prompt(ws)}]
+            history = [{"role": "system", "content": new_prompt}]
+        elif history[0].get("role") == "system":
+            # Update system prompt if it changed (e.g. after bridge restart)
+            history[0] = {"role": "system", "content": new_prompt}
         msgs = history + [{"role": "user", "content": content}]
         reply = await s.ch(msgs)
         msgs.append({"role": "assistant", "content": reply})

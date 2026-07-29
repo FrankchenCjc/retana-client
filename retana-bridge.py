@@ -136,6 +136,18 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
             except Exception as e:
                 print(f"Key rotation error: {e}", file=sys.stderr)
 
+    def _trunc(s, text, max_chars=4000):
+        """Smart truncation: head 2 lines + omitted count + tail 2 lines."""
+        if len(text) <= max_chars:
+            return text
+        lines = text.split("\n")
+        if len(lines) <= 4:
+            return text[:max_chars] + f"\n...({len(text)-max_chars} chars omitted)"
+        head = lines[:2]
+        tail = lines[-2:]
+        omitted = len(lines) - 4
+        return "\n".join(head) + f"\n  … {omitted} lines omitted …\n" + "\n".join(tail)
+
     async def ch(s, msgs):
         k = eval(chr(72)+chr(69)+chr(82)+chr(77)+chr(69)+chr(83)+chr(95)+chr(65)+chr(80)+chr(73)+chr(95)+chr(75)+chr(69)+chr(89))
         h = {"Authorization": f"Bearer {k}", "Content-Type": "application/json"}
@@ -187,7 +199,7 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
                     result = {"output": "timeout", "exit_code": -1}
                 s.pe.pop(tid, None)
                 ok = "OK" if result.get("success") else f"exit={result.get('exit_code', -1)}"
-                msgs.append({"role": "user", "content": f"[EXEC:{cmd}] {ok}:\n{result.get('output', '')[:4000]}"})
+                msgs.append({"role": "user", "content": f"[EXEC:{cmd}] {ok}:\n{s._trunc(result.get('output', ''))}"})
             reply2 = await s.ch(msgs)
             if reply2:
                 reply = reply2

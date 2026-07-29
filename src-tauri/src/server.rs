@@ -27,8 +27,12 @@ fn exec_local(cmd: &str) -> serde_json::Value {
             let stdout = String::from_utf8_lossy(&o.stdout).to_string();
             let stderr = String::from_utf8_lossy(&o.stderr).to_string();
             let combined = if stdout.is_empty() { stderr } else { stdout };
+            // Clean control chars (except newline/tab) that can break JSON
+            let cleaned: String = combined.chars().map(|c| {
+                if c.is_control() && c != '\n' && c != '\t' { ' ' } else { c }
+            }).collect();
             serde_json::json!({
-                "output": combined,
+                "output": cleaned,
                 "exit_code": o.status.code().unwrap_or(-1),
                 "success": o.status.success()
             })
@@ -39,6 +43,23 @@ fn exec_local(cmd: &str) -> serde_json::Value {
             "success": false
         }),
     }
+}
+
+/// Smart truncation: head 2 lines + "... N lines omitted ..." + tail 2 lines
+fn truncate_detail(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() <= 4 {
+        return output.to_string();
+    }
+    let head = &lines[..2];
+    let tail = &lines[lines.len() - 2..];
+    let omitted = lines.len() - 4;
+    format!(
+        "{}\n  … {} lines omitted …\n{}",
+        head.join("\n"),
+        omitted,
+        tail.join("\n")
+    )
 }
 
 pub async fn run_server(port: u16, bridge_url: &str, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
@@ -238,7 +259,7 @@ async fn encrypted_bridge_proxy(
                                                 "label": format!("📋 {}", label),
                                                 "tool_type": "tool_call",
                                                 "status": done_status,
-                                                "detail": result["output"].as_str().unwrap_or("").chars().take(200).collect::<String>()
+                                                "detail": truncate_detail(result["output"].as_str().unwrap_or(""))
                                             });
                                             let _ = tx.send(done_msg.to_string());
                                             continue;

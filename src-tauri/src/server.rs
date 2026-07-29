@@ -94,6 +94,44 @@ fn truncate_detail(output: &str) -> String {
     )
 }
 
+/// Parse [EXEC:command] markers from Hermes reply.
+/// Returns (commands, clean_text) — clean_text has EXEC markers removed.
+fn parse_exec_commands(content: &str) -> (Vec<String>, String) {
+    let mut commands: Vec<String> = Vec::new();
+    let mut clean = String::new();
+    let mut remaining = content;
+
+    while let Some(start) = remaining.find("[EXEC:") {
+        clean.push_str(&remaining[..start]);
+        let after_tag = &remaining[start + 6..]; // skip "[EXEC:"
+        if let Some(end) = after_tag.find(']') {
+            let cmd = after_tag[..end].trim().to_string();
+            if !cmd.is_empty() {
+                commands.push(cmd);
+            }
+            remaining = &after_tag[end + 1..];
+        } else {
+            // No closing bracket — include the tag as-is in clean text
+            clean.push_str(&remaining[start..]);
+            remaining = "";
+        }
+    }
+    clean.push_str(remaining);
+    // Collapse multiple blank lines left by removed EXEC blocks
+    let clean = clean.lines()
+        .fold((String::new(), 0usize), |(mut s, blanks), line| {
+            if line.trim().is_empty() {
+                if blanks < 1 { s.push('\n'); }
+                (s, blanks + 1)
+            } else {
+                s.push_str(line);
+                s.push('\n');
+                (s, 0)
+            }
+        }).0.trim().to_string();
+    (commands, clean)
+}
+
 pub async fn run_server(port: u16, bridge_url: &str, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
     sodiumoxide::init().map_err(|_| anyhow::anyhow!("sodiumoxide init failed"))?;
 
@@ -249,15 +287,90 @@ async fn encrypted_bridge_proxy(
                                             }
                                         }
 
-                                        // Intercept tool_call: execute locally, send result back to bridge
+                                        // Intercept exec_parse: proxy parses [EXEC:...], executes, sends results back
+                                        if msg_type == Some("exec_parse") {
+                                            let batch_id = v.get("batch_id").and_then(|b| b.as_str()).unwrap_or("").to_string();
+                                            let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+
+                                            // Parse all [EXEC:cmd] from Hermes reply
+                                            let (commands, clean_text) = parse_exec_commands(&content);
+                                            log::info!("🔧 exec_parse: {} commands in batch {}", commands.len(), batch_id);
+
+                                            // Forward clean text (no EXEC markers) to frontend immediately
+                                            if !clean_text.is_empty() {
+                                                let clean_msg = serde_json::json!({
+                                                    "type": "chat",
+                                                    "content": clean_text,
+                                                    "sender": "hermes"
+                                                });
+                                                let _ = tx.send(clean_msg.to_string());
+                                            }
+
+                                            // Execute each command sequentially
+                                            let mut results: Vec<serde_json::Value> = Vec::new();
+                                            for cmd in &commands {
+                                                let label = if cmd.len() > 60 { &cmd[..60] } else { cmd.as_str() };
+                                                let start_msg = serde_json::json!({
+                                                    "type": "tool_progress",
+                                                    "label": format!("📋 {}", label),
+                                                    "tool_type": "tool_call",
+                                                    "status": "running"
+                                                });
+                                                let _ = tx.send(start_msg.to_string());
+
+                                                let cmd_clone = cmd.clone();
+                                                let result = match tokio::task::spawn_blocking(move || exec_local(&cmd_clone)).await {
+                                                    Ok(r) => r,
+                                                    Err(e) => serde_json::json!({
+                                                        "output": format!("exec error: {}", e),
+                                                        "exit_code": -1,
+                                                        "success": false
+                                                    }),
+                                                };
+
+                                                let done_status = if result["success"].as_bool().unwrap_or(false) { "done" } else { "error" };
+                                                let done_msg = serde_json::json!({
+                                                    "type": "tool_progress",
+                                                    "label": format!("📋 {}", label),
+                                                    "tool_type": "tool_call",
+                                                    "status": done_status,
+                                                    "detail": truncate_detail(result["output"].as_str().unwrap_or(""))
+                                                });
+                                                let _ = tx.send(done_msg.to_string());
+
+                                                results.push(serde_json::json!({
+                                                    "cmd": cmd,
+                                                    "output": result["output"],
+                                                    "exit_code": result["exit_code"],
+                                                    "success": result["success"]
+                                                }));
+                                            }
+
+                                            // Send all results back to bridge
+                                            let results_msg = serde_json::json!({
+                                                "type": "exec_results",
+                                                "batch_id": batch_id,
+                                                "results": results
+                                            });
+                                            let pk = { state.lock().unwrap().pk.clone() };
+                                            let mut payload = Vec::from(epk.as_ref());
+                                            payload.extend_from_slice(results_msg.to_string().as_bytes());
+                                            let sealed = sealedbox::seal(&payload, &pk);
+                                            if ws.send(Message::Binary(sealed.into())).await.is_err() {
+                                                log::error!("Bridge proxy: exec_results send failed");
+                                                break;
+                                            }
+                                            log::info!("🔧 exec_results sent: {} commands", results.len());
+                                            continue;
+                                        }
+
+                                        // Fallback: intercept tool_call for backward compat
                                         if msg_type == Some("tool_call") {
                                             let task_id = v.get("task_id").and_then(|t| t.as_str()).unwrap_or("").to_string();
                                             let command = v.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string();
                                             let label = v.get("label").and_then(|l| l.as_str()).unwrap_or(&command).to_string();
 
-                                            log::info!("🔧 EXEC: {}", &command);
-
-                                            // Notify frontend: execution started
+                                            log::info!("🔧 EXEC (legacy tool_call): {}", &command);
                                             let start_msg = serde_json::json!({
                                                 "type": "tool_progress",
                                                 "label": format!("📋 {}", label),
@@ -266,7 +379,6 @@ async fn encrypted_bridge_proxy(
                                             });
                                             let _ = tx.send(start_msg.to_string());
 
-                                            // Execute locally in thread pool (non-blocking for tokio)
                                             let cmd = command.clone();
                                             let result = match tokio::task::spawn_blocking(move || exec_local(&cmd)).await {
                                                 Ok(r) => r,
@@ -277,7 +389,6 @@ async fn encrypted_bridge_proxy(
                                                 }),
                                             };
 
-                                            // Send result back to bridge (encrypted)
                                             let result_msg = serde_json::json!({
                                                 "type": "tool_result",
                                                 "task_id": task_id,
@@ -294,7 +405,6 @@ async fn encrypted_bridge_proxy(
                                                 break;
                                             }
 
-                                            // Notify frontend: done
                                             let done_status = if result["success"].as_bool().unwrap_or(false) { "done" } else { "error" };
                                             let detail = truncate_detail(result["output"].as_str().unwrap_or(""));
                                             log::info!("🔧 EXEC done [{}]: {}", done_status, &detail.lines().next().unwrap_or(""));

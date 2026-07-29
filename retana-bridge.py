@@ -192,34 +192,32 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
         msgs = history + [{"role": "user", "content": content}]
         reply = await s.ch(msgs)
         msgs.append({"role": "assistant", "content": reply})
-        execs = re.findall(r'\[EXEC:(.+?)\]', reply)
-        if execs:
-            print(f"🔧 EXEC found: {execs}", file=sys.stderr)
-            for cmd in execs:
-                cmd = cmd.strip()
-                tid = str(uuid.uuid4())[:8]
-                print(f"🔧 → sending tool_call: {cmd[:80]}", file=sys.stderr)
-                await s.bc({"type": "tool_call", "task_id": tid, "command": cmd, "label": cmd[:60]})
-                fut = asyncio.get_event_loop().create_future()
-                s.pe[tid] = fut
-                try:
-                    result = await asyncio.wait_for(fut, timeout=30)
-                    print(f"🔧 ← result: success={result.get('success')}, len={len(result.get('output',''))}",
-                          file=sys.stderr)
-                except asyncio.TimeoutError:
-                    print(f"🔧 ← TIMEOUT after 30s", file=sys.stderr)
-                    result = {"output": "timeout", "exit_code": -1, "success": False}
-                s.pe.pop(tid, None)
-                ok = "OK" if result.get("success") else f"exit={result.get('exit_code', -1)}"
-                msgs.append({"role": "user", "content": f"[EXEC:{cmd}] {ok}:\n{s._trunc(result.get('output', ''), max_chars=16000)}"})
+
+        # If Hermes included [EXEC:...], forward to proxy for parsing + execution
+        if '[EXEC:' in reply:
+            bid = str(uuid.uuid4())[:8]
+            print(f"🔧 → exec_parse [{bid}]", file=sys.stderr)
+            await s.bc({"type": "exec_parse", "content": reply, "batch_id": bid})
+            fut = asyncio.get_event_loop().create_future()
+            s.pe[bid] = fut
+            try:
+                results = await asyncio.wait_for(fut, timeout=60)
+                print(f"🔧 ← exec_results: {len(results.get('results',[]))} commands", file=sys.stderr)
+            except asyncio.TimeoutError:
+                print(f"🔧 ← TIMEOUT after 60s", file=sys.stderr)
+                results = {"results": [{"cmd": "unknown", "output": "timeout", "success": False}]}
+            s.pe.pop(bid, None)
+            for r in results.get("results", []):
+                ok = "OK" if r.get("success") else f"exit={r.get('exit_code', -1)}"
+                msgs.append({"role": "user", "content": f"[EXEC:{r.get('cmd','')}] {ok}:\n{r.get('output','')[:16000]}"})
             reply2 = await s.ch(msgs)
             if reply2:
                 reply = reply2
                 msgs.append({"role": "assistant", "content": reply})
             else:
-                print(f"🔧 WARNING: reply2 was empty, stripping EXEC markers", file=sys.stderr)
-                reply = re.sub(r'\[EXEC:.+?\]', '[command executed]', reply)
-        # Safety net: always strip any remaining EXEC markers before showing user
+                reply = re.sub(r'\[EXEC:.+?\]', '', reply)
+
+        # Safety net: strip any remaining EXEC markers
         reply = re.sub(r'\[EXEC:.+?\]', '', reply).strip()
         if reply:
             await s.bc({"type": "chat", "content": reply, "sender": "hermes"})
@@ -283,6 +281,10 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
                 tid = d.get("task_id", "")
                 if tid in s.pe:
                     s.pe[tid].set_result(d)
+            elif t == "exec_results":
+                bid = d.get("batch_id", "")
+                if bid in s.pe:
+                    s.pe[bid].set_result(d)
         except Exception:
             traceback.print_exc()
 

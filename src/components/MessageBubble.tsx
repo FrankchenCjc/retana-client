@@ -21,10 +21,23 @@ export default function MessageBubble({ message }: Props) {
   const isUser = message.sender === 'user';
   const isSystem = message.sender === 'system';
 
+  // Operation-only message (tool progress): render as compact inline indicator
+  const isToolProgress = !message.content && message.operations && message.operations.length > 0;
+
   if (isSystem) {
     return (
       <div className="message-system">
         <span>{message.content}</span>
+      </div>
+    );
+  }
+
+  if (isToolProgress) {
+    return (
+      <div className="message-tool-inline">
+        {message.operations!.map(op => (
+          <OperationBadge key={op.id} op={op} />
+        ))}
       </div>
     );
   }

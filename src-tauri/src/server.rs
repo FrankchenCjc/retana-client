@@ -8,11 +8,38 @@
 // with OLD key. Retana decrypts, switches to new key for subsequent messages.
 use futures_util::{SinkExt, StreamExt};
 use sodiumoxide::crypto::{box_, sealedbox};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
+
+/// Execute a local command and return structured result
+fn exec_local(cmd: &str) -> serde_json::Value {
+    let output = if cfg!(target_os = "windows") {
+        Command::new("cmd").args(["/C", cmd]).output()
+    } else {
+        Command::new("sh").args(["-c", cmd]).output()
+    };
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+            let combined = if stdout.is_empty() { stderr } else { stdout };
+            serde_json::json!({
+                "output": combined,
+                "exit_code": o.status.code().unwrap_or(-1),
+                "success": o.status.success()
+            })
+        }
+        Err(e) => serde_json::json!({
+            "output": e.to_string(),
+            "exit_code": -1,
+            "success": false
+        }),
+    }
+}
 
 pub async fn run_server(port: u16, bridge_url: &str, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
     sodiumoxide::init().map_err(|_| anyhow::anyhow!("sodiumoxide init failed"))?;
@@ -156,7 +183,9 @@ async fn encrypted_bridge_proxy(
                                 if let Ok(text) = String::from_utf8(plain.clone()) {
                                     // Check for key rotation
                                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                        if v.get("type").and_then(|t| t.as_str()) == Some("key_rot") {
+                                        let msg_type = v.get("type").and_then(|t| t.as_str());
+
+                                        if msg_type == Some("key_rot") {
                                             if let Some(h) = v.get("pubkey").and_then(|p| p.as_str()) {
                                                 if let Ok(b) = hex::decode(h) {
                                                     if let Some(new_pk) = box_::PublicKey::from_slice(&b) {
@@ -165,6 +194,54 @@ async fn encrypted_bridge_proxy(
                                                     }
                                                 }
                                             }
+                                        }
+
+                                        // Intercept tool_call: execute locally, send result back to bridge
+                                        if msg_type == Some("tool_call") {
+                                            let task_id = v.get("task_id").and_then(|t| t.as_str()).unwrap_or("");
+                                            let command = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                                            let label = v.get("label").and_then(|l| l.as_str()).unwrap_or(command);
+
+                                            // Notify frontend: execution started
+                                            let start_msg = serde_json::json!({
+                                                "type": "tool_progress",
+                                                "label": format!("📋 {}", label),
+                                                "tool_type": "tool_call",
+                                                "status": "running"
+                                            });
+                                            let _ = tx.send(start_msg.to_string());
+
+                                            // Execute locally (blocking — ok since this is in a spawned task)
+                                            let result = exec_local(command);
+
+                                            // Send result back to bridge (encrypted)
+                                            let result_msg = serde_json::json!({
+                                                "type": "tool_result",
+                                                "task_id": task_id,
+                                                "output": result["output"],
+                                                "exit_code": result["exit_code"],
+                                                "success": result["success"]
+                                            });
+                                            let pk = { state.lock().unwrap().pk.clone() };
+                                            let mut payload = Vec::from(epk.as_ref());
+                                            payload.extend_from_slice(result_msg.to_string().as_bytes());
+                                            let sealed = sealedbox::seal(&payload, &pk);
+                                            if ws.send(Message::Binary(sealed.into())).await.is_err() {
+                                                log::error!("Bridge proxy: tool_result send failed");
+                                                break;
+                                            }
+
+                                            // Notify frontend: done
+                                            let done_status = if result["success"].as_bool().unwrap_or(false) { "done" } else { "error" };
+                                            let done_msg = serde_json::json!({
+                                                "type": "tool_progress",
+                                                "label": format!("📋 {}", label),
+                                                "tool_type": "tool_call",
+                                                "status": done_status,
+                                                "detail": result["output"].as_str().unwrap_or("").chars().take(200).collect::<String>()
+                                            });
+                                            let _ = tx.send(done_msg.to_string());
+                                            continue;
                                         }
                                     }
                                     let _ = tx.send(text);

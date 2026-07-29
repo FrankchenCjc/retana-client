@@ -281,6 +281,41 @@ html, body, #root {
   border-radius: 10px;
 }
 
+/* Compact inline tool progress — no bubble, just a thin status line */
+.message-tool-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 16px;
+  font-size: 11px;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
+.message-tool-inline .operation-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 3px;
+  border-left: 2px solid var(--accent);
+}
+
+.message-tool-inline .op-label {
+  font-size: 11px;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.message-tool-inline .op-detail {
+  font-size: 10px;
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
 .message-row {
   display: flex;
   gap: 8px;

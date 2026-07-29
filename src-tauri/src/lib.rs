@@ -120,7 +120,7 @@ pub fn run() {
     // Start the local WebSocket server + bridge proxy
     let server_shutdown = Arc::clone(&shutdown);
     let server_port: u16 = 9000;
-    let bridge_url = "wss://115.159.116.195:9001/ws".to_string();
+    let bridge_url = "ws://115.159.116.195:9001/ws".to_string();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new()
             .expect("Failed to create server Tokio runtime");

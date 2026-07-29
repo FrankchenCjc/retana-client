@@ -32,10 +32,13 @@ ssh2 = "0.9"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# WebSocket (local server for Hermes tunnel + wss proxy)
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-tokio-native-tls = "0.4"
+# WebSocket (local server for Hermes tunnel)
+tokio-tungstenite = "0.24"
 futures-util = "0.3"
+
+# NaCl encryption (sealed box + box, no TLS)
+sodiumoxide = "0.2"
+hex = "0.4"
 
 # YAML config
 serde_yaml = "0.9"

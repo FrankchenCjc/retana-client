@@ -57,6 +57,7 @@ class B:
         s.eph = {}
         s.env = {}      # per-connection env_info: ws → {os, arch, shell, hostname}
         s.hist = {}     # per-connection conversation history: ws → [{role, content}]
+        s.cmd_futs = {} # batch_id → {future, results[], expected} for \c protocol
         s._sk = BRIDGE_SK  # mutable for key rotation
 
     @property
@@ -70,24 +71,27 @@ class B:
         shell = info.get("shell", "bash")
         hostname = info.get("hostname", "unknown")
         return f"""You are speaking through retana, a Tauri desktop app on {hostname} ({os_name}, {shell} shell).
-To run commands on the user's machine, output: [EXEC:command]
+To run commands on the user's machine, output: \\c <command> \\e
 The command will be executed in {shell}.
 IMPORTANT: on Windows, encoding is handled automatically (UTF-8/UTF-16LE).
-Use plain commands like [EXEC:dir D:\\] or [EXEC:type file.txt].
+Use plain commands like \\c dir D:\\\\ \\e or \\c type file.txt \\e.
 Do NOT include 'chcp', encoding prefixes, or cmd /c wrappers in your commands.
-Do NOT include [EXEC:...] in your final reply to the user — it is an internal mechanism. Wait for the execution result before responding."""
+Do NOT include \\c...\\e in your final reply to the user — it is an internal mechanism. Wait for the execution result before responding."""
 
     async def bc(s, m, ws=None, encrypt=True):
-        """Broadcast to all clients. encrypt=True uses Box for each client."""
+        """Broadcast to all clients. encrypt=True uses Box for each client. Handles both dict and raw string."""
         dead = set()
         for w in s.cs:
             try:
-                if encrypt and isinstance(m, dict) and w in s.eph:
+                if encrypt and w in s.eph:
                     box = Box(s._sk, s.eph[w])
-                    enc = box.encrypt(json.dumps(m).encode())
+                    payload = json.dumps(m).encode() if isinstance(m, dict) else str(m).encode()
+                    enc = box.encrypt(payload)
                     await w.send_bytes(enc)
-                else:
+                elif isinstance(m, dict):
                     await w.send_json(m)
+                else:
+                    await w.send_str(str(m))
             except:
                 dead.add(w)
         s.cs -= dead
@@ -184,44 +188,63 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
         history = s.hist.get(ws, [])
         new_prompt = s._sys_prompt(ws)
         if not history:
-            # First message: prepend system prompt
             history = [{"role": "system", "content": new_prompt}]
         elif history[0].get("role") == "system":
-            # Update system prompt if it changed (e.g. after bridge restart)
             history[0] = {"role": "system", "content": new_prompt}
         msgs = history + [{"role": "user", "content": content}]
         reply = await s.ch(msgs)
         msgs.append({"role": "assistant", "content": reply})
 
-        # If Hermes included [EXEC:...], forward to proxy for parsing + execution
-        if '[EXEC:' in reply:
-            bid = str(uuid.uuid4())[:8]
-            print(f"🔧 → exec_parse [{bid}]", file=sys.stderr)
-            await s.bc({"type": "exec_parse", "content": reply, "batch_id": bid})
-            fut = asyncio.get_event_loop().create_future()
-            s.pe[bid] = fut
-            try:
-                results = await asyncio.wait_for(fut, timeout=60)
-                print(f"🔧 ← exec_results: {len(results.get('results',[]))} commands", file=sys.stderr)
-            except asyncio.TimeoutError:
-                print(f"🔧 ← TIMEOUT after 60s", file=sys.stderr)
-                results = {"results": [{"cmd": "unknown", "output": "timeout", "success": False}]}
-            s.pe.pop(bid, None)
-            for r in results.get("results", []):
-                ok = "OK" if r.get("success") else f"exit={r.get('exit_code', -1)}"
-                msgs.append({"role": "user", "content": f"[EXEC:{r.get('cmd','')}] {ok}:\n{r.get('output','')[:16000]}"})
-            reply2 = await s.ch(msgs)
-            if reply2:
-                reply = reply2
-                msgs.append({"role": "assistant", "content": reply})
-            else:
-                reply = re.sub(r'\[EXEC:.+?\]', '', reply)
+        # ── New \\c protocol: extract \\c...\\e blocks, assign IDs, execute ──
+        if '\\c ' in reply or (reply.startswith('\\c') and '\\e' in reply):
+            batch_prefix = format(abs(hash(str(ws))) % 0x10000, '04x')[:4]
+            cmd_blocks = []
+            counter = [0]
 
-        # Safety net: strip any remaining EXEC markers
-        reply = re.sub(r'\[EXEC:.+?\]', '', reply).strip()
+            def assign_id(m):
+                cmd = m.group(1).strip()
+                if not cmd:
+                    return m.group(0)
+                cid = f"{batch_prefix}{counter[0]:02d}"
+                counter[0] += 1
+                cmd_blocks.append((cid, cmd))
+                return f"\\c{cid} {cmd} \\e"
+
+            modified = re.sub(r'\\c\s+(.+?)\s*\\e', assign_id, reply)
+
+            if cmd_blocks:
+                fut = asyncio.get_event_loop().create_future()
+                s.cmd_futs[batch_prefix] = {"future": fut, "results": [], "expected": len(cmd_blocks)}
+
+                # Send raw text with \\c<ID> <cmd> \\e to proxy for execution
+                print(f"🔧 → {len(cmd_blocks)} commands [{batch_prefix}]", file=sys.stderr)
+                await s.bc(modified)
+
+                try:
+                    results = await asyncio.wait_for(fut, timeout=60)
+                    print(f"🔧 ← results: {len(results.get('results',[]))}/{len(cmd_blocks)}", file=sys.stderr)
+                except asyncio.TimeoutError:
+                    print(f"🔧 ← TIMEOUT after 60s", file=sys.stderr)
+                    results = {"results": []}
+                s.cmd_futs.pop(batch_prefix, None)
+
+                # Feed results back to Hermes
+                for r in results.get("results", []):
+                    ok = "OK" if r.get("success") else f"exit={r.get('exit_code', -1)}"
+                    msgs.append({"role": "user", "content": f"[{r.get('cmd','')}] {ok}:\n{r.get('output','')[:16000]}"})
+
+                reply2 = await s.ch(msgs)
+                if reply2:
+                    reply = reply2
+                    msgs.append({"role": "assistant", "content": reply})
+                else:
+                    reply = re.sub(r'\\c.*?\\e', '', reply).strip()
+
+        # Strip any remaining \\c...\\e markers, send clean reply to proxy → frontend
+        reply = re.sub(r'\\c.*?\\e', '', reply).strip()
         if reply:
-            await s.bc({"type": "chat", "content": reply, "sender": "hermes"})
-        # Save history (trim to last 50 messages to avoid context overflow)
+            await s.bc(reply)
+        # Save history (trim to last 50 messages)
         s.hist[ws] = msgs[-50:]
 
     async def wh(s, req):
@@ -262,7 +285,7 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
         return ws
 
     def _handle_binary(s, data, ws):
-        """Decrypt SealedBox → extract ephemeral key → process message."""
+        """Decrypt SealedBox → extract ephemeral key → dispatch by content."""
         try:
             sealed = SealedBox(s._sk)
             plain = sealed.decrypt(data)
@@ -271,20 +294,51 @@ Do NOT include [EXEC:...] in your final reply to the user — it is an internal 
             eph_pk = PublicKey(plain[:32], RawEncoder)
             s.eph[ws] = eph_pk
 
-            # Parse and handle the message
             msg_text = plain[32:].decode("utf-8")
-            d = json.loads(msg_text)
-            t = d.get("type", "")
-            if t == "chat" and d.get("sender") == "user":
-                asyncio.create_task(s.hc(d.get("content", ""), ws))
-            elif t == "tool_result":
-                tid = d.get("task_id", "")
-                if tid in s.pe:
-                    s.pe[tid].set_result(d)
-            elif t == "exec_results":
-                bid = d.get("batch_id", "")
-                if bid in s.pe:
-                    s.pe[bid].set_result(d)
+
+            # ── \\c<id> <json> \\e → command result from proxy ──
+            m = re.match(r'\\c(\S+)\s+(\{.*?\})\s*\\e', msg_text, re.DOTALL)
+            if m:
+                cid = m.group(1)
+                try:
+                    result = json.loads(m.group(2))
+                except json.JSONDecodeError:
+                    return
+                batch_prefix = cid[:4]
+                if batch_prefix in s.cmd_futs:
+                    batch = s.cmd_futs[batch_prefix]
+                    batch["results"].append(result)
+                    if len(batch["results"]) >= batch["expected"]:
+                        if not batch["future"].done():
+                            batch["future"].set_result({"results": batch["results"]})
+                return
+
+            # ── JSON → old protocol or system messages ──
+            try:
+                d = json.loads(msg_text)
+            except (json.JSONDecodeError, ValueError):
+                d = None
+
+            if isinstance(d, dict):
+                t = d.get("type", "")
+                if t == "chat" and d.get("sender") == "user":
+                    asyncio.create_task(s.hc(d.get("content", ""), ws))
+                elif t == "tool_result":
+                    tid = d.get("task_id", "")
+                    if tid in s.pe:
+                        s.pe[tid].set_result(d)
+                elif t == "exec_results":
+                    bid = d.get("batch_id", "")
+                    if bid in s.pe:
+                        s.pe[bid].set_result(d)
+                elif t == "env_info":
+                    s.env[ws] = {k: d.get(k, "") for k in ("os", "arch", "shell", "hostname")}
+                return
+
+            # ── Raw text → treat as user chat ──
+            if msg_text.strip():
+                asyncio.create_task(s.hc(msg_text.strip(), ws))
+
         except Exception:
             traceback.print_exc()
 

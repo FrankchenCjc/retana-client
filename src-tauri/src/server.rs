@@ -18,8 +18,6 @@ use tokio_tungstenite::tungstenite::Message;
 /// Execute a local command and return structured result
 fn exec_local(cmd: &str) -> serde_json::Value {
     let output = if cfg!(target_os = "windows") {
-        // cmd /U = UTF-16LE output for internal commands (dir, type, etc.)
-        // chcp 65001 = UTF-8 for external commands — belt and suspenders
         let effective = format!("chcp 65001 > nul & {}", cmd);
         Command::new("cmd").args(["/U", "/C", &effective]).output()
     } else {
@@ -27,7 +25,6 @@ fn exec_local(cmd: &str) -> serde_json::Value {
     };
     match output {
         Ok(o) => {
-            // cmd /U produces UTF-16LE — decode accordingly
             let decoded = if cfg!(target_os = "windows") {
                 decode_cmd_output(&o.stdout, &o.stderr)
             } else {
@@ -35,7 +32,6 @@ fn exec_local(cmd: &str) -> serde_json::Value {
                  String::from_utf8_lossy(&o.stderr).to_string())
             };
             let combined = if decoded.0.is_empty() { decoded.1 } else { decoded.0 };
-            // Clean control chars (except newline/tab) that can break JSON
             let cleaned: String = combined.chars().map(|c| {
                 if c.is_control() && c != '\n' && c != '\t' { ' ' } else { c }
             }).collect();
@@ -46,137 +42,74 @@ fn exec_local(cmd: &str) -> serde_json::Value {
             })
         }
         Err(e) => serde_json::json!({
-            "output": e.to_string(),
-            "exit_code": -1,
-            "success": false
+            "output": e.to_string(), "exit_code": -1, "success": false
         }),
     }
 }
 
-/// Decode cmd /U (UTF-16LE) output, with UTF-8 fallback
 fn decode_cmd_output(stdout: &[u8], stderr: &[u8]) -> (String, String) {
     (decode_best_effort(stdout), decode_best_effort(stderr))
 }
 
 fn decode_best_effort(bytes: &[u8]) -> String {
-    // Try UTF-16LE first (cmd /U output)
     if bytes.len() >= 2 {
-        let u16s: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
+        let u16s: Vec<u16> = bytes.chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         let s = String::from_utf16_lossy(&u16s);
-        // If it looks reasonable (not full of replacement chars), keep it
-        let replacement_ratio = s.chars().filter(|&c| c == '\u{FFFD}').count() as f32
+        let ratio = s.chars().filter(|&c| c == '\u{FFFD}').count() as f32
             / s.chars().count().max(1) as f32;
-        if replacement_ratio < 0.5 {
-            return s.trim_end_matches('\0').to_string();
-        }
+        if ratio < 0.5 { return s.trim_end_matches('\0').to_string(); }
     }
-    // Fallback: try UTF-8
     String::from_utf8_lossy(bytes).to_string()
 }
 
-/// Smart truncation: head 2 lines + "... N lines omitted ..." + tail 2 lines
-fn truncate_detail(output: &str) -> String {
-    let lines: Vec<&str> = output.lines().collect();
-    if lines.len() <= 4 {
-        return output.to_string();
-    }
-    let head = &lines[..2];
-    let tail = &lines[lines.len() - 2..];
-    let omitted = lines.len() - 4;
-    format!(
-        "{}\n  … {} lines omitted …\n{}",
-        head.join("\n"),
-        omitted,
-        tail.join("\n")
-    )
-}
 
-/// Parse [EXEC:command] markers from Hermes reply.
-/// Returns (commands, clean_text) — clean_text has EXEC markers removed.
-fn parse_exec_commands(content: &str) -> (Vec<String>, String) {
-    let mut commands: Vec<String> = Vec::new();
-    let mut clean = String::new();
-    let mut remaining = content;
 
-    while let Some(start) = remaining.find("[EXEC:") {
-        clean.push_str(&remaining[..start]);
-        let after_tag = &remaining[start + 6..]; // skip "[EXEC:"
-        if let Some(end) = after_tag.find(']') {
-            let cmd = after_tag[..end].trim().to_string();
-            if !cmd.is_empty() {
-                commands.push(cmd);
-            }
-            remaining = &after_tag[end + 1..];
+/// Dead-simple: cut every \\c...\\e block mechanically. No validation, no parsing.
+fn strip_cmd_blocks(text: &str) -> String {
+    let mut out = String::new();
+    let mut remaining = text;
+    while let Some(pos) = remaining.find("\\c") {
+        out.push_str(&remaining[..pos]);
+        let after = &remaining[pos + 2..];
+        if let Some(e_pos) = after.find("\\e") {
+            remaining = &after[e_pos + 2..];
         } else {
-            // No closing bracket — include the tag as-is in clean text
-            clean.push_str(&remaining[start..]);
-            remaining = "";
+            out.push_str("\\c");
+            remaining = after;
         }
     }
-    clean.push_str(remaining);
-    // Collapse multiple blank lines left by removed EXEC blocks
-    let clean = clean.lines()
-        .fold((String::new(), 0usize), |(mut s, blanks), line| {
-            if line.trim().is_empty() {
-                if blanks < 1 { s.push('\n'); }
-                (s, blanks + 1)
-            } else {
-                s.push_str(line);
-                s.push('\n');
-                (s, 0)
-            }
-        }).0.trim().to_string();
-    (commands, clean)
+    out.push_str(remaining);
+    out.trim().to_string()
 }
+
 
 pub async fn run_server(port: u16, bridge_url: &str, shutdown: Arc<AtomicBool>) -> anyhow::Result<()> {
     sodiumoxide::init().map_err(|_| anyhow::anyhow!("sodiumoxide init failed"))?;
-
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
     log::info!("🖥 Local WS server on ws://{}", addr);
-
     let (tx, _rx) = broadcast::channel::<String>(256);
-
-    let proxy_tx = tx.clone();
-    let proxy_rx = tx.subscribe();
-    let proxy_shutdown = Arc::clone(&shutdown);
     let url = bridge_url.to_string();
-    tokio::spawn(async move {
-        encrypted_bridge_proxy(proxy_tx, proxy_rx, &url, proxy_shutdown).await;
-    });
-
+    tokio::spawn(encrypted_bridge_proxy(tx.clone(), tx.subscribe(), url, Arc::clone(&shutdown)));
     loop {
         tokio::select! {
             result = listener.accept() => {
-                match result {
-                    Ok((stream, _peer)) => {
-                        let tx = tx.clone();
-                        let rx = tx.subscribe();
-                        let shutdown = Arc::clone(&shutdown);
-                        tokio::spawn(handle_connection(stream, tx, rx, shutdown));
-                    }
-                    Err(e) => log::error!("Accept error: {}", e),
+                if let Ok((stream, _)) = result {
+                    tokio::spawn(handle_connection(stream, tx.clone(), tx.subscribe(), Arc::clone(&shutdown)));
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
+                if shutdown.load(Ordering::Relaxed) { break; }
             }
         }
     }
     Ok(())
 }
 
-/// Mutable bridge state: just the public key (rotates on key_rot)
-struct BridgeState {
-    pk: box_::PublicKey,
-}
+// ── Bridge proxy ────────────────────────────────────────
 
+struct BridgeState { pk: box_::PublicKey }
 impl BridgeState {
     fn rotate(&mut self, new_pk: box_::PublicKey) {
         self.pk = new_pk;
@@ -184,21 +117,62 @@ impl BridgeState {
     }
 }
 
+/// Nonce(24) || ciphertext → plaintext. One call replaces 4 match levels.
+fn try_decrypt(data: &[u8], state: &Arc<Mutex<BridgeState>>, esk: &box_::SecretKey) -> Option<String> {
+    let nonce = box_::Nonce::from_slice(&data.get(..24)?)?;
+    let pk = state.lock().unwrap().pk;
+    let plain = box_::open(data.get(24..)?, &nonce, &pk, esk).ok()?;
+    String::from_utf8(plain).ok()
+}
+
+/// SealedBox helper: epk || payload, then seal with bridge_pk
+fn seal_payload(payload: &str, epk: &box_::PublicKey, state: &Arc<Mutex<BridgeState>>) -> Vec<u8> {
+    let pk = state.lock().unwrap().pk;
+    let mut buf = Vec::from(epk.as_ref());
+    buf.extend_from_slice(payload.as_bytes());
+    sealedbox::seal(&buf, &pk)
+}
+
+/// Notify frontend of tool execution progress — sends per-line output (no truncation, no JSON)
+fn notify_progress(tx: &broadcast::Sender<String>, label: &str, status: &str, detail: Option<&str>) {
+    let tag = match status {
+        "running" => "\\c> ",
+        "done"    => "\\c✓ ",
+        _         => "\\c✗ ",
+    };
+    let _ = tx.send(format!("{tag}{label}"));
+    if let Some(d) = detail {
+        // Per-line \\c= prefix so every line renders as output
+        for line in d.lines() {
+            let _ = tx.send(format!("\\c= {line}"));
+        }
+    }
+}
+
+/// Execute a single command, notifying frontend of start/end (raw output, no truncation)
+async fn exec_one(cmd_str: &str, tx: &broadcast::Sender<String>) -> serde_json::Value {
+    let label = if cmd_str.len() > 60 { &cmd_str[..60] } else { cmd_str };
+    notify_progress(tx, label, "running", None);
+    let cmd = cmd_str.to_string();
+    let result = match tokio::task::spawn_blocking(move || exec_local(&cmd)).await {
+        Ok(r) => r, Err(e) => serde_json::json!({"output":format!("exec error: {}", e),"exit_code":-1,"success":false}),
+    };
+    let status = if result["success"].as_bool().unwrap_or(false) { "done" } else { "error" };
+    notify_progress(tx, label, status, Some(result["output"].as_str().unwrap_or("")));
+    result
+}
+
 async fn encrypted_bridge_proxy(
     tx: broadcast::Sender<String>,
     mut rx: broadcast::Receiver<String>,
-    url: &str,
+    url: String,
     shutdown: Arc<AtomicBool>,
 ) {
-    let (mut ws, _) = match tokio_tungstenite::connect_async(url).await {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("Bridge proxy: connect failed: {}", e);
-            return;
-        }
+    let (mut ws, _) = match tokio_tungstenite::connect_async(&url).await {
+        Ok(c) => c, Err(e) => { log::error!("Bridge proxy: connect failed: {}", e); return; }
     };
 
-    // Bootstrap: read bridge's public key (plaintext first message)
+    // Bootstrap: plaintext key announcement
     let bridge_pk = match ws.next().await {
         Some(Ok(Message::Text(text))) => {
             match serde_json::from_str::<serde_json::Value>(&text) {
@@ -213,45 +187,25 @@ async fn encrypted_bridge_proxy(
         }
         _ => None,
     };
-
     let bridge_pk = match bridge_pk {
         Some(pk) => pk,
-        None => {
-            log::error!("Bridge proxy: no key announcement");
-            return;
-        }
+        None => { log::error!("Bridge proxy: no key announcement"); return; }
     };
 
     let (epk, esk) = box_::gen_keypair();
     let state = Arc::new(Mutex::new(BridgeState { pk: bridge_pk }));
-
     log::info!("🔗 Bridge proxy ready (NaCl, mutable key)");
-    tx.send(r#"{"type":"chat","content":"🟢 本地端点已就绪","sender":"system"}"#.into()).ok();
+    tx.send("\\cs 🟢 本地端点已就绪".into()).ok();
 
     loop {
         tokio::select! {
-            // Frontend → Bridge: SealedBox (one-way, no nonce needed)
+            // ── Frontend → Bridge: raw text → sealedbox ──
             msg = rx.recv() => {
                 match msg {
                     Ok(text) => {
-                        let forward = serde_json::from_str::<serde_json::Value>(&text)
-                            .map(|v| {
-                                let t = v.get("type").and_then(|t| t.as_str());
-                                let s = v.get("sender").and_then(|s| s.as_str());
-                                t == Some("chat") && s == Some("user")
-                                    || t == Some("env_info")   // forward env info too
-                                    || t == Some("tool_result")  // forward command execution results
-                            })
-                            .unwrap_or(false);
-                        if forward {
-                            let pk = { state.lock().unwrap().pk.clone() };
-                            let mut payload = Vec::from(epk.as_ref());
-                            payload.extend_from_slice(text.as_bytes());
-                            let sealed = sealedbox::seal(&payload, &pk);
-                            if ws.send(Message::Binary(sealed.into())).await.is_err() {
-                                log::error!("Bridge proxy: send failed");
-                                break;
-                            }
+                        let sealed = seal_payload(&text, &epk, &state);
+                        if ws.send(Message::Binary(sealed.into())).await.is_err() {
+                            log::error!("Bridge proxy: send failed"); break;
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -259,180 +213,95 @@ async fn encrypted_bridge_proxy(
                 }
             }
 
-            // Bridge → Frontend: Box decrypt (nonce(24) || ciphertext)
+            // ── Bridge → Frontend: decrypt → string-match dispatch ──
             ws_msg = ws.next() => {
                 match ws_msg {
                     Some(Ok(Message::Binary(data))) => {
-                        if data.len() < 24 { continue; }
-                        let nonce = match box_::Nonce::from_slice(&data[..24]) {
-                            Some(n) => n,
-                            None => continue,
+                        let text = match try_decrypt(&data, &state, &esk) {
+                            Some(t) => t, None => continue,
                         };
-                        let pk = { state.lock().unwrap().pk.clone() };
-                        match box_::open(&data[24..], &nonce, &pk, &esk) {
-                            Ok(plain) => {
-                                if let Ok(text) = String::from_utf8(plain.clone()) {
-                                    // Check for key rotation
-                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                        let msg_type = v.get("type").and_then(|t| t.as_str());
 
-                                        if msg_type == Some("key_rot") {
-                                            if let Some(h) = v.get("pubkey").and_then(|p| p.as_str()) {
-                                                if let Ok(b) = hex::decode(h) {
-                                                    if let Some(new_pk) = box_::PublicKey::from_slice(&b) {
-                                                        state.lock().unwrap().rotate(new_pk);
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-                                        }
+                        // Internal: key rotation (\k <hex_pubkey>)
+                        if text.starts_with("\\k ") {
+                            let hex_key = &text[3..].trim();
+                            if let Some(pk) = hex::decode(hex_key).ok()
+                                .and_then(|b| box_::PublicKey::from_slice(&b))
+                            { state.lock().unwrap().rotate(pk); }
+                            continue;
+                        }
 
-                                        // Intercept exec_parse: proxy parses [EXEC:...], executes, sends results back
-                                        if msg_type == Some("exec_parse") {
-                                            let batch_id = v.get("batch_id").and_then(|b| b.as_str()).unwrap_or("").to_string();
-                                            let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
+                        // Internal intercepts — mechanically find \\c...\\e blocks, execute what's inside
+                        // Format: \\c<first 6 chars = id><space><cmd>\\e  (no validation, dead simple)
+                        let mut exec_commands: Vec<(String, String)> = Vec::new(); // (id, cmd)
+                        let mut remaining = text.as_str();
 
-                                            // Parse all [EXEC:cmd] from Hermes reply
-                                            let (commands, clean_text) = parse_exec_commands(&content);
-                                            log::info!("🔧 exec_parse: {} commands in batch {}", commands.len(), batch_id);
+                        while let Some(c_pos) = remaining.find("\\c") {
+                            let after_c = &remaining[c_pos + 2..];
+                            if let Some(e_pos) = after_c.find("\\e") {
+                                let block = &after_c[..e_pos];
+                                // Mechanical split: first 6 chars = id, skip space, rest = cmd
+                                let id: String = block.chars().take(6).collect();
+                                let cmd = if block.len() > 7 && block.as_bytes()[6] == b' ' {
+                                    block[7..].trim().to_string()
+                                } else {
+                                    block[6..].trim().to_string()
+                                };
+                                if !cmd.is_empty() {
+                                    exec_commands.push((id, cmd));
+                                }
+                                remaining = &after_c[e_pos + 2..];
+                            } else {
+                                remaining = after_c;
+                            }
+                        }
 
-                                            // Forward clean text (no EXEC markers) to frontend immediately
-                                            if !clean_text.is_empty() {
-                                                let clean_msg = serde_json::json!({
-                                                    "type": "chat",
-                                                    "content": clean_text,
-                                                    "sender": "hermes"
-                                                });
-                                                let _ = tx.send(clean_msg.to_string());
-                                            }
+                        if !exec_commands.is_empty() {
+                            // Strip \\c<id> <cmd> \\e blocks, forward clean chat to frontend
+                            let clean = strip_cmd_blocks(&text);
+                            if !clean.is_empty() { let _ = tx.send(clean); }
 
-                                            // Execute each command sequentially
-                                            let mut results: Vec<serde_json::Value> = Vec::new();
-                                            for cmd in &commands {
-                                                let label = if cmd.len() > 60 { &cmd[..60] } else { cmd.as_str() };
-                                                let start_msg = serde_json::json!({
-                                                    "type": "tool_progress",
-                                                    "label": format!("📋 {}", label),
-                                                    "tool_type": "tool_call",
-                                                    "status": "running"
-                                                });
-                                                let _ = tx.send(start_msg.to_string());
-
-                                                let cmd_clone = cmd.clone();
-                                                let result = match tokio::task::spawn_blocking(move || exec_local(&cmd_clone)).await {
-                                                    Ok(r) => r,
-                                                    Err(e) => serde_json::json!({
-                                                        "output": format!("exec error: {}", e),
-                                                        "exit_code": -1,
-                                                        "success": false
-                                                    }),
-                                                };
-
-                                                let done_status = if result["success"].as_bool().unwrap_or(false) { "done" } else { "error" };
-                                                let done_msg = serde_json::json!({
-                                                    "type": "tool_progress",
-                                                    "label": format!("📋 {}", label),
-                                                    "tool_type": "tool_call",
-                                                    "status": done_status,
-                                                    "detail": truncate_detail(result["output"].as_str().unwrap_or(""))
-                                                });
-                                                let _ = tx.send(done_msg.to_string());
-
-                                                results.push(serde_json::json!({
-                                                    "cmd": cmd,
-                                                    "output": result["output"],
-                                                    "exit_code": result["exit_code"],
-                                                    "success": result["success"]
-                                                }));
-                                            }
-
-                                            // Send all results back to bridge
-                                            let results_msg = serde_json::json!({
-                                                "type": "exec_results",
-                                                "batch_id": batch_id,
-                                                "results": results
-                                            });
-                                            let pk = { state.lock().unwrap().pk.clone() };
-                                            let mut payload = Vec::from(epk.as_ref());
-                                            payload.extend_from_slice(results_msg.to_string().as_bytes());
-                                            let sealed = sealedbox::seal(&payload, &pk);
-                                            if ws.send(Message::Binary(sealed.into())).await.is_err() {
-                                                log::error!("Bridge proxy: exec_results send failed");
-                                                break;
-                                            }
-                                            log::info!("🔧 exec_results sent: {} commands", results.len());
-                                            continue;
-                                        }
-
-                                        // Fallback: intercept tool_call for backward compat
-                                        if msg_type == Some("tool_call") {
-                                            let task_id = v.get("task_id").and_then(|t| t.as_str()).unwrap_or("").to_string();
-                                            let command = v.get("command").and_then(|c| c.as_str()).unwrap_or("").to_string();
-                                            let label = v.get("label").and_then(|l| l.as_str()).unwrap_or(&command).to_string();
-
-                                            log::info!("🔧 EXEC (legacy tool_call): {}", &command);
-                                            let start_msg = serde_json::json!({
-                                                "type": "tool_progress",
-                                                "label": format!("📋 {}", label),
-                                                "tool_type": "tool_call",
-                                                "status": "running"
-                                            });
-                                            let _ = tx.send(start_msg.to_string());
-
-                                            let cmd = command.clone();
-                                            let result = match tokio::task::spawn_blocking(move || exec_local(&cmd)).await {
-                                                Ok(r) => r,
-                                                Err(e) => serde_json::json!({
-                                                    "output": format!("exec error: {}", e),
-                                                    "exit_code": -1,
-                                                    "success": false
-                                                }),
-                                            };
-
-                                            let result_msg = serde_json::json!({
-                                                "type": "tool_result",
-                                                "task_id": task_id,
-                                                "output": result["output"],
-                                                "exit_code": result["exit_code"],
-                                                "success": result["success"]
-                                            });
-                                            let pk = { state.lock().unwrap().pk.clone() };
-                                            let mut payload = Vec::from(epk.as_ref());
-                                            payload.extend_from_slice(result_msg.to_string().as_bytes());
-                                            let sealed = sealedbox::seal(&payload, &pk);
-                                            if ws.send(Message::Binary(sealed.into())).await.is_err() {
-                                                log::error!("Bridge proxy: tool_result send failed");
-                                                break;
-                                            }
-
-                                            let done_status = if result["success"].as_bool().unwrap_or(false) { "done" } else { "error" };
-                                            let detail = truncate_detail(result["output"].as_str().unwrap_or(""));
-                                            log::info!("🔧 EXEC done [{}]: {}", done_status, &detail.lines().next().unwrap_or(""));
-                                            let done_msg = serde_json::json!({
-                                                "type": "tool_progress",
-                                                "label": format!("📋 {}", label),
-                                                "tool_type": "tool_call",
-                                                "status": done_status,
-                                                "detail": detail
-                                            });
-                                            let _ = tx.send(done_msg.to_string());
-                                            continue;
-                                        }
-                                    }
-                                    let _ = tx.send(text);
+                            // Multiple commands → list header first
+                            if exec_commands.len() > 1 {
+                                let _ = tx.send(format!("\\c> ⚡ 批量执行 ({} 条命令):", exec_commands.len()));
+                                for (i, (_, cmd)) in exec_commands.iter().enumerate() {
+                                    let short = if cmd.len() > 50 { &cmd[..50] } else { cmd.as_str() };
+                                    let _ = tx.send(format!("\\c=   [{}/{}] {}", i + 1, exec_commands.len(), short));
                                 }
                             }
-                            Err(_) => log::error!("Bridge proxy: decrypt failed"),
+
+                            let mut results = Vec::new();
+                            for (i, (batch_id, cmd)) in exec_commands.iter().enumerate() {
+                                let label = if exec_commands.len() > 1 {
+                                    format!("[{}/{}] {}", i + 1, exec_commands.len(), cmd)
+                                } else {
+                                    cmd.clone()
+                                };
+                                let r = exec_one(&label, &tx).await;
+                                results.push(serde_json::json!({
+                                    "batch_id": batch_id, "cmd": cmd,
+                                    "output": r["output"], "exit_code": r["exit_code"], "success": r["success"]
+                                }));
+                            }
+
+                            // Send all results back to bridge: \c<batch_id> <json> \e per result
+                            for (batch_id, _) in &exec_commands {
+                                let result_json = results.iter()
+                                    .find(|r| r["batch_id"].as_str() == Some(batch_id.as_str()))
+                                    .cloned().unwrap_or(serde_json::json!({"error":"not found"}));
+                                let result_text = format!("\\c{} {} \\e", batch_id, result_json);
+                                let sealed = seal_payload(&result_text, &epk, &state);
+                                if ws.send(Message::Binary(sealed.into())).await.is_err() { break; }
+                            }
+                            continue;
                         }
+
+                        // Fallback: forward raw decrypted text to frontend
+                        let _ = tx.send(text);
                     }
-                    Some(Ok(Message::Text(text))) => {
-                        let _ = tx.send(text.to_string());
-                    }
-                    Some(Ok(Message::Ping(data))) => {
-                        let _ = ws.send(Message::Pong(data)).await;
-                    }
+                    Some(Ok(Message::Text(text))) => { let _ = tx.send(text.to_string()); }
+                    Some(Ok(Message::Ping(data))) => { let _ = ws.send(Message::Pong(data)).await; }
                     Some(Ok(Message::Close(_))) | None => {
-                        tx.send(r#"{"type":"chat","content":"🔴 连接已断开","sender":"system"}"#.into()).ok();
+                        tx.send("\\e 🔴 连接已断开".into()).ok();
                         break;
                     }
                     Some(Err(_)) => break,
@@ -448,6 +317,8 @@ async fn encrypted_bridge_proxy(
     let _ = ws.close(None).await;
 }
 
+// ── Local WS connection handler ──────────────────────────
+
 async fn handle_connection(
     stream: TcpStream,
     tx: broadcast::Sender<String>,
@@ -455,8 +326,7 @@ async fn handle_connection(
     shutdown: Arc<AtomicBool>,
 ) {
     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(e) => { log::error!("WS handshake fail: {}", e); return; }
+        Ok(ws) => ws, Err(e) => { log::error!("WS handshake fail: {}", e); return; }
     };
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     loop {
@@ -466,8 +336,8 @@ async fn handle_connection(
                     Some(Ok(Message::Text(text))) => { let _ = tx.send(text.to_string()); }
                     Some(Ok(Message::Ping(data))) => { let _ = ws_sender.send(Message::Pong(data)).await; }
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
                     Some(Err(_)) => break,
+                    _ => {}
                 }
             }
             broadcast_msg = rx.recv() => {
